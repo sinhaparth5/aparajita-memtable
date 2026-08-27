@@ -2,11 +2,38 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Build and test
+
+```sh
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release   # add -DAPARAJITA_NATIVE=ON for -march=native
+cmake --build build -j$(nproc)
+ctest --test-dir build --output-on-failure       # correctness gate for the search kernels
+./build/counter_report                           # hardware counters: cycles and branch misses per probe
+./build/bench_search                             # Google Benchmark timings
+./scripts/run_phase1.sh                          # all of the above, writing results/
+```
+
+`counter_report` takes optional positional arguments: probe count, repetitions, hit ratio
+(`./build/counter_report 200000 9 0.75`). Google Benchmark is fetched at configure time; pass
+`-DAPARAJITA_BENCHMARKS=OFF` to build offline without it.
+
+Two measurement cautions on this class of host. Wall-clock timings from `bench_search` are noisy
+under WSL2 or on a loaded machine, with coefficients of variation reaching 60%; the PMU cycle
+counts from `counter_report` are the reliable instrument because they are immune to frequency
+scaling. And `counter_report` needs `/proc/sys/kernel/perf_event_paranoid` at 2 or lower. It uses
+`perf_event_open(2)` directly, so the `perf` binary does not need to be installed.
+
+## Layout
+
+`include/aparajita/` holds the public headers: `node.hpp` for the 64-byte node and its constants,
+`search.hpp` for the scalar and SIMD kernels plus runtime dispatch, `workload.hpp` for the
+branch-hostile probe generator shared by tests and benchmarks. `bench/` and `tests/` hold the
+harnesses, `docs/phase1.md` the findings, `results/` the committed measurement output.
+
 ## State of the repository
 
-There is no source code yet. The tree holds a research document, a roadmap, a README, both license
-texts, and a `.gitignore` configured for CMake and CLion. There are no build, lint, or test
-commands to document; replace this section when the first ones land.
+Phase 1 is complete except for the AVX-512 runtime check, which needs hardware this development
+host lacks. There is no RocksDB integration yet; that is Phase 3.
 
 The project is dual-licensed under Apache 2.0 or MIT at the user's option, with the texts in
 `LICENSE-APACHE` and `LICENSE-MIT`. New source files should carry an SPDX header of
@@ -23,6 +50,14 @@ The design rests on three things: 64-byte cache line alignment (`alignas(64)`) s
 a line, branchless SIMD search over vector comparison masks (`_mm256_cmpeq_epi32` plus a movemask)
 instead of a conditional jump per comparison, and lock-free concurrency through C++20
 acquire/release atomics.
+
+Two conventions in the existing kernels are load-bearing and measured, not stylistic. Search
+returns `kNotFound` (equal to `kNodeKeys`) rather than -1, because a -1 sentinel forces a
+data-dependent ternary that cost 0.5 branch mispredictions per probe and four fifths of the AVX2
+kernel's cycles; folding the miss into the compare mask as bit 16 removes it. And `kEmptyKey` is
+`0xFFFFFFFF` so that it sorts above every real key, which keeps a partially filled node sorted.
+Use `_mm256_movemask_ps` on a cast rather than `_mm256_movemask_epi8`, which yields four bits per
+lane and needs the trailing-zero count divided by 4.
 
 It integrates by deriving from `rocksdb::MemTableRep` and `rocksdb::MemTableRepFactory`, selected
 through `options.memtable_factory`.

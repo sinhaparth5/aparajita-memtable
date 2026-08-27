@@ -48,8 +48,10 @@ has to satisfy.
 
 ## Phase 1: environment and micro-benchmarking primitives
 
-Weeks 1-2. Goal: prove the SIMD search wins on a standalone kernel before any of it touches
-RocksDB.
+Weeks 1-2. Complete, apart from the AVX-512 runtime check. Results and analysis in
+[docs/phase1.md](docs/phase1.md); reproduce with `./scripts/run_phase1.sh`.
+
+Goal: prove the SIMD search wins on a standalone kernel before any of it touches RocksDB.
 
 Stand up CMake with C++20, Google Benchmark, and the `perf` invocations that will be used for the
 rest of the project. Write a standalone micro-benchmark over a 64-byte node: scalar linear search,
@@ -67,11 +69,20 @@ One implementation detail to get right early: `_mm256_movemask_epi8` on the resu
 `_mm256_movemask_ps` on a cast of the same vector gives 8 bits directly and is usually the cleaner
 choice.
 
-| Exit criterion | Target |
-| --- | --- |
-| Branch misses on the SIMD probe | below 0.5% of branches, versus the scalar baseline measured on the same input (proposed) |
-| Cycles per lookup, AVX2 versus scalar | a measured ratio with confidence intervals, not a single run |
-| AVX-512 path | correct under CPUID gating, with downclocking effects on the host recorded |
+| Exit criterion | Target | Result |
+| --- | --- | --- |
+| Branch misses on the SIMD probe | below 0.5% of branches | met: 0.00 to 0.04% |
+| Cycles per lookup, AVX2 versus scalar | measured ratio with dispersion | met: 4.3x to 4.9x (7.0 versus 30.0 cycles/probe) |
+| AVX-512 path | correct under CPUID gating, downclocking recorded | blocked: the development host is an i5-8400H with no AVX-512, so the path is compiled and CPUID-gated but has never executed |
+
+The AVX-512 gap carries into Phase 4, since a paper claiming an AVX-512 result needs a machine
+that has it: Skylake-SP or newer Xeon, Ice Lake or newer client, or Zen 4.
+
+One result changed the design rather than just measuring it. Returning -1 for "not found" costs
+about 0.5 branch mispredictions per probe, because the ternary that produces it is data-dependent
+and unpredictable at a realistic hit ratio. Folding the miss into the compare mask as bit 16 and
+returning `kNodeKeys` instead took the AVX2 kernel from 25.4 to 6.2 cycles per probe. Any hot-path
+API in Phase 2 that reports absence through a sentinel should use the same convention.
 
 ## Phase 2: node layout and concurrency
 
