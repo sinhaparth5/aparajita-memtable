@@ -113,12 +113,21 @@ Memory has a constraint too. RocksDB hands the rep an `Allocator*` backed by its
 allocations through it are what charge against `write_buffer_size`. Arena memory is bump-allocated
 and cannot be reallocated, so a growable array has to be segmented into chunks rather than resized.
 
-| Exit criterion | Target |
-| --- | --- |
-| ThreadSanitizer over concurrent insert and read | clean, at 1, 4, 16, and 64 threads |
-| Surrogate collision rate | measured on at least one realistic key distribution, not synthetic sequential keys |
-| Ordering decision | ordered structure or sort-on-flush, decided and written down |
-| Node layout | verified 64-byte aligned and 64 bytes in size by static_assert |
+Results and analysis in [docs/phase2.md](docs/phase2.md), decisions in
+[docs/phase2-design.md](docs/phase2-design.md).
+
+| Exit criterion | Target | Result |
+| --- | --- | --- |
+| ThreadSanitizer over concurrent insert and read | clean, at 1, 4, 16, and 64 threads | partial: clean at 1, 4 and 16; 64 does not complete under instrumentation on an 8-core host and passes uninstrumented |
+| Surrogate collision rate | measured on at least one realistic key distribution, not synthetic sequential keys | met, on seven; the result invalidated the leading-bytes surrogate and forced prefix truncation |
+| Ordering decision | ordered structure or sort-on-flush, decided and written down | met: ordered |
+| Node layout | verified 64-byte aligned and 64 bytes in size by static_assert | met |
+
+Two findings carry into Phase 3. Copy-on-write costs 448 bytes per key against the
+skiplist's rough 50, which no probe-side speed compensates for and which Phase 3
+must fix before any `db_bench` comparison is meaningful. And the surrogate is only
+useful after the node's shared prefix is stripped, which is now a property the
+RocksDB integration has to preserve when internal keys replace plain user keys.
 
 ## Phase 3: RocksDB plugin integration
 
