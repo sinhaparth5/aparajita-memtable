@@ -11,6 +11,15 @@
 // process, where startup and workload generation dominate.
 //
 // Requires /proc/sys/kernel/perf_event_paranoid <= 2 for user-space events.
+//
+// PERF_COUNT_HW_REF_CPU_CYCLES is here for one reason: it is the only way this
+// harness can see frequency at all. CPU_CYCLES is immune to frequency scaling,
+// which is exactly why the rest of the report trusts it, and exactly why it
+// cannot answer the AVX-512 downclocking question. REF_CPU_CYCLES ticks at the
+// invariant reference rate instead, so cycles/ref-cycles is the effective
+// frequency as a multiple of nominal: above 1.0 the part is in turbo, below 1.0
+// it has been clocked down. Comparing that ratio across kernels in one run is
+// the downclock measurement.
 
 #include <linux/perf_event.h>
 #include <sys/ioctl.h>
@@ -76,20 +85,27 @@ private:
     std::string name_;
 };
 
+// Five events, and the count is deliberate. On Intel, instructions, cycles, and
+// ref-cycles occupy the three fixed-function counters, leaving branches and
+// branch-misses to two of the four general-purpose slots. Nothing multiplexes, so
+// no reading is scaled by the kernel and the numbers are exact rather than
+// extrapolated. A sixth event would change that and every value with it.
 struct CounterSet {
     Counter cycles{PERF_COUNT_HW_CPU_CYCLES, "cycles"};
+    Counter ref_cycles{PERF_COUNT_HW_REF_CPU_CYCLES, "ref-cycles"};
     Counter instructions{PERF_COUNT_HW_INSTRUCTIONS, "instructions"};
     Counter branches{PERF_COUNT_HW_BRANCH_INSTRUCTIONS, "branches"};
     Counter branch_misses{PERF_COUNT_HW_BRANCH_MISSES, "branch-misses"};
 
     bool all_available() const noexcept {
-        return cycles.available() && instructions.available() &&
+        return cycles.available() && ref_cycles.available() && instructions.available() &&
                branches.available() && branch_misses.available();
     }
 };
 
 struct Reading {
     std::uint64_t cycles{};
+    std::uint64_t ref_cycles{};
     std::uint64_t instructions{};
     std::uint64_t branches{};
     std::uint64_t branch_misses{};

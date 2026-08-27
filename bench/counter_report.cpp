@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 //
-// Phase 1 headline measurement: branch mispredictions and cycles per node
-// lookup, for each search kernel, on a single L1-resident node.
+// Phase 1 headline measurement: branch mispredictions, cycles, and effective
+// frequency per node lookup, for each search kernel, on a single L1-resident node.
 //
 // A single node is deliberate. It removes memory-hierarchy effects so what
 // remains is the cost of the comparison strategy itself, which is the claim
@@ -42,6 +42,7 @@ bench::Reading measure(SearchFn fn, const Node& node,
     }
 
     c.cycles.start();
+    c.ref_cycles.start();
     c.instructions.start();
     c.branches.start();
     c.branch_misses.start();
@@ -54,6 +55,7 @@ bench::Reading measure(SearchFn fn, const Node& node,
     r.branch_misses = c.branch_misses.stop();
     r.branches = c.branches.stop();
     r.instructions = c.instructions.stop();
+    r.ref_cycles = c.ref_cycles.stop();
     r.cycles = c.cycles.stop();
 
     g_sink = acc;
@@ -128,10 +130,10 @@ int main(int argc, char** argv) {
         }
     }
 
-    std::printf("%-18s %10s %8s %10s %6s %11s %10s %8s\n",
+    std::printf("%-18s %10s %8s %10s %6s %11s %10s %8s %8s\n",
                 "kernel", "cyc/probe", "cyc sd", "ins/probe", "IPC",
-                "brnch/prb", "miss/prb", "miss%");
-    std::printf("%s\n", std::string(90, '-').c_str());
+                "brnch/prb", "miss/prb", "miss%", "freq/nom");
+    std::printf("%s\n", std::string(99, '-').c_str());
 
     for (const auto& k : kernels) {
         if (k.needs == Isa::Avx2 && host == Isa::Scalar) {
@@ -143,7 +145,7 @@ int main(int argc, char** argv) {
             continue;
         }
 
-        std::vector<double> cyc, ins, brn, mis;
+        std::vector<double> cyc, ins, brn, mis, freq;
         for (int r = 0; r < reps; ++r) {
             const auto x = measure(k.fn, node, probes, counters);
             const double n = static_cast<double>(probe_count);
@@ -151,12 +153,18 @@ int main(int argc, char** argv) {
             ins.push_back(static_cast<double>(x.instructions) / n);
             brn.push_back(static_cast<double>(x.branches) / n);
             mis.push_back(static_cast<double>(x.branch_misses) / n);
+            // Effective frequency as a multiple of nominal. Guarded because
+            // ref-cycles reads zero on a host that silently refused the event,
+            // and a division by it would print an infinity that looks like data.
+            freq.push_back(x.ref_cycles > 0
+                               ? static_cast<double>(x.cycles) / static_cast<double>(x.ref_cycles)
+                               : 0.0);
         }
 
         const double c = median(cyc), i = median(ins), b = median(brn), m = median(mis);
-        std::printf("%-18s %10.2f %8.2f %10.2f %6.2f %11.2f %10.4f %7.2f%%\n",
+        std::printf("%-18s %10.2f %8.2f %10.2f %6.2f %11.2f %10.4f %7.2f%% %8.3f\n",
                     k.name, c, stddev(cyc), i, i / c, b, m,
-                    b > 0 ? 100.0 * m / b : 0.0);
+                    b > 0 ? 100.0 * m / b : 0.0, median(freq));
     }
 
     return 0;

@@ -1,0 +1,13 @@
+host ISA        : avx2
+probes per rep  : 200000
+repetitions     : 9 (median reported)
+hit ratio       : 0.50
+
+kernel              cyc/probe   cyc sd  ins/probe    IPC   brnch/prb   miss/prb    miss%
+------------------------------------------------------------------------------------------
+scalar_linear           30.04     1.63      35.00   1.17       14.70     0.5278    3.59%
+scalar_autovec          29.69     4.60      35.00   1.18       14.70     0.5274    3.59%
+scalar_branchless       23.31     1.79      89.00   3.82        3.00     0.0001    0.00%
+scalar_binary           86.90     8.43      53.41   0.61       14.16     2.1021   14.85%
+avx2                     7.00     3.38      20.00   2.86        3.00     0.0012    0.04%
+avx512             skipped: host lacks avx512f (compiled, not executed)
