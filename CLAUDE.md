@@ -4,12 +4,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## State of the repository
 
-There is no source code yet. The tree holds a research document, a roadmap, an Apache 2.0 LICENSE,
-a one-line README, and a `.gitignore` configured for CMake and CLion. There are no build, lint, or
-test commands to document; replace this section when the first ones land.
+There is no source code yet. The tree holds a research document, a roadmap, a README, both license
+texts, and a `.gitignore` configured for CMake and CLion. There are no build, lint, or test
+commands to document; replace this section when the first ones land.
 
-The project commits to dual Apache 2.0 / MIT licensing, but only the Apache text is present. A
-`LICENSE-MIT` file is still needed.
+The project is dual-licensed under Apache 2.0 or MIT at the user's option, with the texts in
+`LICENSE-APACHE` and `LICENSE-MIT`. New source files should carry an SPDX header of
+`// SPDX-License-Identifier: Apache-2.0 OR MIT`.
 
 ## What the project is
 

@@ -34,14 +34,17 @@ moves.
 
 ## Where the repo stands
 
-The tree holds the architecture document, this roadmap, a `CLAUDE.md`, an Apache 2.0 LICENSE, a
-one-line README, and a CMake/CLion `.gitignore`. No source, no build system, no tests.
+The tree holds the architecture document, this roadmap, a `CLAUDE.md`, a README, both license
+texts, and a CMake/CLion `.gitignore`. No source, no build system, no tests.
 
-Two setup items are worth clearing in week 1 alongside Phase 1. The dual Apache 2.0 / MIT license
-the project commits to needs a second `LICENSE-MIT` file and a note in the README, since only the
-Apache text is present today. And RocksDB itself needs to be a pinned dependency from the start
-rather than at Phase 3, because its `MemTableRep` header is what Phase 2's node layout has to
-satisfy.
+Licensing is settled: dual Apache 2.0 or MIT at the user's option, following the convention of
+paired `LICENSE-APACHE` and `LICENSE-MIT` files with the election stated in the README. Source
+files should carry `// SPDX-License-Identifier: Apache-2.0 OR MIT`, and the CMake package metadata
+should declare the same once Phase 1 creates it.
+
+One setup item remains for week 1 alongside Phase 1. RocksDB needs to be a pinned dependency from
+the start rather than at Phase 3, because its `MemTableRep` header is what Phase 2's node layout
+has to satisfy.
 
 ## Phase 1: environment and micro-benchmarking primitives
 
