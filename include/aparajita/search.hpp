@@ -138,6 +138,91 @@ inline int search_avx512(const Node& n, std::uint32_t key) noexcept {
 #endif // APARAJITA_X86
 
 // ---------------------------------------------------------------------------
+// Ordered search: lower_bound over a sorted node
+// ---------------------------------------------------------------------------
+
+// The kernels above answer "is this key present", which is all a point lookup
+// needs. RocksDB needs more than that: MemTableRep iterators must yield keys in
+// comparator order, and Seek(target) must land on the first key >= target. This
+// is the primitive that supplies both, and it is why Phase 2 chose an ordered
+// structure over VectorRep's sort-at-flush.
+//
+// The trick is that over a *sorted* node the compare mask is a prefix of set
+// bits, so its popcount is exactly the number of keys below the needle, which is
+// exactly lower_bound. No trailing-zero count, no sentinel bit, and no branch.
+// It also falls out that "greater than everything in this node" returns
+// kNodeKeys, matching the kNotFound convention the equality kernels established.
+//
+// Every kernel here requires n.keys sorted ascending. kEmptyKey padding in the
+// tail satisfies that by construction, since it sorts above every real key.
+using LowerBoundFn = int (*)(const Node&, std::uint32_t) noexcept;
+
+// Branchy reference. Vectorization disabled for the same reason as
+// search_scalar_linear: left alone the compiler reaches for the vector unit and
+// the baseline stops being a baseline.
+inline int lower_bound_scalar(const Node& n, std::uint32_t key) noexcept {
+    int i = 0;
+#if defined(__clang__)
+#pragma clang loop vectorize(disable)
+#elif defined(__GNUC__)
+#pragma GCC novector
+#endif
+    while (i < static_cast<int>(kNodeKeys) && n.keys[i] < key) {
+        ++i;
+    }
+    return i;
+}
+
+// Counts rather than early-exits, so the loop has one predictable backedge.
+inline int lower_bound_scalar_branchless(const Node& n, std::uint32_t key) noexcept {
+    int count = 0;
+    for (int i = 0; i < static_cast<int>(kNodeKeys); ++i) {
+        count += static_cast<int>(n.keys[i] < key);
+    }
+    return count;
+}
+
+#if APARAJITA_X86
+
+// _mm256_cmpgt_epi32 is a SIGNED compare and these keys are unsigned, which is a
+// trap rather than a detail: kEmptyKey is 0xFFFFFFFF, which reads as -1 signed
+// and would sort below every real key instead of above it, inverting the padding.
+// XOR-ing both sides by 0x80000000 maps the unsigned order onto the signed one.
+// kEmptyKey biases to INT32_MAX, so the sentinel keeps sorting above everything,
+// exactly as it does unbiased.
+__attribute__((target("avx2")))
+inline int lower_bound_avx2(const Node& n, std::uint32_t key) noexcept {
+    const __m256i bias = _mm256_set1_epi32(INT32_MIN);
+    const __m256i needle = _mm256_xor_si256(_mm256_set1_epi32(static_cast<int>(key)), bias);
+
+    const __m256i lo = _mm256_load_si256(reinterpret_cast<const __m256i*>(n.keys));
+    const __m256i hi = _mm256_load_si256(reinterpret_cast<const __m256i*>(n.keys) + 1);
+
+    // keys[i] < key, expressed as needle > keys[i] with the identical bias applied
+    // to both sides so the relation is preserved.
+    const __m256i lt_lo = _mm256_cmpgt_epi32(needle, _mm256_xor_si256(lo, bias));
+    const __m256i lt_hi = _mm256_cmpgt_epi32(needle, _mm256_xor_si256(hi, bias));
+
+    const unsigned m_lo = static_cast<unsigned>(_mm256_movemask_ps(_mm256_castsi256_ps(lt_lo)));
+    const unsigned m_hi = static_cast<unsigned>(_mm256_movemask_ps(_mm256_castsi256_ps(lt_hi)));
+
+    return __builtin_popcount(m_lo | (m_hi << 8));
+}
+
+// AVX-512 has a native unsigned compare, so the bias the AVX2 path needs
+// disappears entirely: four instructions become two, and the sign-extension trap
+// above cannot arise.
+__attribute__((target("avx512f")))
+inline int lower_bound_avx512(const Node& n, std::uint32_t key) noexcept {
+    const __m512i needle = _mm512_set1_epi32(static_cast<int>(key));
+    const __m512i line = _mm512_load_si512(reinterpret_cast<const void*>(n.keys));
+    const __mmask16 mask = _mm512_cmplt_epu32_mask(line, needle);
+    return __builtin_popcount(static_cast<unsigned>(mask));
+}
+
+#endif // APARAJITA_X86
+
+// ---------------------------------------------------------------------------
 // Runtime dispatch
 // ---------------------------------------------------------------------------
 
