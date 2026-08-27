@@ -253,6 +253,17 @@ inline const char* isa_name(Isa isa) noexcept {
 // Resolved once, not per call. A function pointer costs an indirect jump, which
 // is exactly what the project is trying to remove from the hot path, so Phase 2
 // should hoist this decision to a template parameter instead.
+// Same ISA decision as search_dispatch, for the ordered kernels.
+inline LowerBoundFn lower_bound_dispatch() noexcept {
+    switch (detect_isa()) {
+#if APARAJITA_X86
+        case Isa::Avx512: return &lower_bound_avx512;
+        case Isa::Avx2:   return &lower_bound_avx2;
+#endif
+        default:          return &lower_bound_scalar_branchless;
+    }
+}
+
 inline SearchFn search_dispatch() noexcept {
     switch (detect_isa()) {
 #if APARAJITA_X86

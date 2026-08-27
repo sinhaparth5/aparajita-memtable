@@ -66,3 +66,30 @@ if(APARAJITA_BENCHMARKS)
     add_executable(bench_search bench/bench_search.cpp)
     target_link_libraries(bench_search PRIVATE aparajita aparajita_flags benchmark::benchmark)
 endif()
+
+# Phase 2 targets.
+add_executable(test_memtable tests/test_memtable.cpp)
+target_link_libraries(test_memtable PRIVATE aparajita aparajita_flags)
+add_test(NAME memtable COMMAND test_memtable)
+
+add_executable(test_concurrent tests/test_concurrent.cpp)
+target_link_libraries(test_concurrent PRIVATE aparajita aparajita_flags)
+find_package(Threads REQUIRED)
+target_link_libraries(test_concurrent PRIVATE Threads::Threads)
+add_test(NAME concurrent_insert COMMAND test_concurrent)
+
+add_executable(collision_report bench/collision_report.cpp)
+target_link_libraries(collision_report PRIVATE aparajita aparajita_flags)
+
+# ThreadSanitizer build of the concurrency test. A separate target rather than a
+# global flag, because TSan instruments everything it links and the timing
+# harnesses must stay uninstrumented to remain meaningful.
+option(APARAJITA_TSAN "Build the ThreadSanitizer concurrency target" ON)
+if(APARAJITA_TSAN)
+    add_executable(test_concurrent_tsan tests/test_concurrent.cpp)
+    target_link_libraries(test_concurrent_tsan PRIVATE aparajita Threads::Threads)
+    target_compile_options(test_concurrent_tsan PRIVATE
+        -O1 -g -fno-omit-frame-pointer -fsanitize=thread -Wall -Wextra)
+    target_link_options(test_concurrent_tsan PRIVATE -fsanitize=thread)
+    add_test(NAME concurrent_insert_tsan COMMAND test_concurrent_tsan)
+endif()
