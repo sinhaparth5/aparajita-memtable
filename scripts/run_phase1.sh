@@ -18,7 +18,10 @@ echo "== environment =="
     echo "kernel:  $(uname -sr)"
     echo "cpu:     $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | sed 's/^ //')"
     echo "cores:   $(nproc) logical"
-    echo "gcc:     $(g++ --version | head -1)"
+    # The compiler CMake actually used, not whatever "g++" resolves to. These
+    # differ whenever CXX is set, and environment.txt is the provenance record a
+    # reader trusts, so reporting the wrong one silently misattributes results.
+    echo "gcc:     $("$(cmake -LA -N "$BUILD_DIR" 2>/dev/null | sed -n 's/^CMAKE_CXX_COMPILER:[^=]*=//p')" --version 2>/dev/null | head -1)"
     echo "governor: $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo 'unavailable')"
     echo "paranoid: $(cat /proc/sys/kernel/perf_event_paranoid)"
 } | tee "$OUT_DIR/environment.txt"

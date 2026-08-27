@@ -1,0 +1,75 @@
+== hit ratio 0.00 ==
+host ISA        : avx512f
+probes per rep  : 200000
+repetitions     : 9 (median reported)
+hit ratio       : 0.00
+
+kernel              cyc/probe   cyc sd  ins/probe    IPC   brnch/prb   miss/prb    miss% freq/nom
+---------------------------------------------------------------------------------------------------
+scalar_linear           10.02     0.00      42.00   4.19       19.00     0.0000    0.00%    1.740
+scalar_autovec          10.02     0.00      42.00   4.19       19.00     0.0000    0.00%    1.740
+scalar_branchless       16.53     0.00      90.00   5.45        3.00     0.0000    0.00%    1.436
+scalar_binary           61.59     0.14      57.72   0.94       15.19     1.5509   10.21%    1.740
+avx2                     5.01     0.00      20.00   3.99        3.00     0.0000    0.00%    1.741
+avx512                   4.01     0.00      15.00   3.74        3.00     0.0000    0.00%    1.741
+
+== hit ratio 0.25 ==
+host ISA        : avx512f
+probes per rep  : 200000
+repetitions     : 9 (median reported)
+hit ratio       : 0.25
+
+kernel              cyc/probe   cyc sd  ins/probe    IPC   brnch/prb   miss/prb    miss% freq/nom
+---------------------------------------------------------------------------------------------------
+scalar_linear           19.15     0.04      38.24   2.00       17.11     0.2598    1.52%    1.716
+scalar_autovec          19.21     0.03      38.24   1.99       17.11     0.2619    1.53%    1.656
+scalar_branchless       16.53     0.01      90.00   5.45        3.00     0.0000    0.00%    1.702
+scalar_binary           65.63     0.12      54.57   0.83       14.18     1.7223   12.15%    1.700
+avx2                     5.01     0.00      20.00   3.99        3.00     0.0000    0.00%    1.741
+avx512                   4.01     0.00      15.00   3.74        3.00     0.0000    0.00%    1.741
+
+== hit ratio 0.50 ==
+host ISA        : avx512f
+probes per rep  : 200000
+repetitions     : 9 (median reported)
+hit ratio       : 0.50
+
+kernel              cyc/probe   cyc sd  ins/probe    IPC   brnch/prb   miss/prb    miss% freq/nom
+---------------------------------------------------------------------------------------------------
+scalar_linear           27.72     0.12      34.50   1.24       15.24     0.5238    3.44%    1.655
+scalar_autovec          27.70     0.06      34.50   1.25       15.24     0.5277    3.46%    1.740
+scalar_branchless       16.53     0.00      90.00   5.45        3.00     0.0000    0.00%    1.740
+scalar_binary           69.64     0.32      51.41   0.74       13.16     1.9007   14.45%    1.739
+avx2                     5.01     0.00      20.00   3.99        3.00     0.0000    0.00%    1.740
+avx512                   4.02     0.00      15.00   3.74        3.00     0.0000    0.00%    1.741
+
+== hit ratio 0.75 ==
+host ISA        : avx512f
+probes per rep  : 200000
+repetitions     : 9 (median reported)
+hit ratio       : 0.75
+
+kernel              cyc/probe   cyc sd  ins/probe    IPC   brnch/prb   miss/prb    miss% freq/nom
+---------------------------------------------------------------------------------------------------
+scalar_linear           35.36     0.05      30.77   0.87       13.36     0.8044    6.02%    1.740
+scalar_autovec          35.34     0.07      30.77   0.87       13.36     0.8035    6.01%    1.740
+scalar_branchless       16.56     0.00      90.00   5.43        3.00     0.0000    0.00%    1.717
+scalar_binary           68.46     0.47      48.24   0.70       12.13     1.8840   15.53%    1.696
+avx2                     5.01     0.00      20.00   3.99        3.00     0.0000    0.00%    1.740
+avx512                   4.01     0.00      15.00   3.74        3.00     0.0000    0.00%    1.741
+
+== hit ratio 1.00 ==
+host ISA        : avx512f
+probes per rep  : 200000
+repetitions     : 9 (median reported)
+hit ratio       : 1.00
+
+kernel              cyc/probe   cyc sd  ins/probe    IPC   brnch/prb   miss/prb    miss% freq/nom
+---------------------------------------------------------------------------------------------------
+scalar_linear           40.05     0.13      27.03   0.67       11.48     1.0081    8.78%    1.653
+scalar_autovec          40.14     0.11      27.03   0.67       11.48     1.0107    8.80%    1.740
+scalar_branchless       16.56     0.00      90.00   5.43        3.00     0.0000    0.00%    1.740
+scalar_binary           60.43     0.44      45.16   0.75       11.13     1.6343   14.68%    1.719
+avx2                     5.01     0.00      20.00   3.99        3.00     0.0000    0.00%    1.741
+avx512                   4.01     0.00      15.00   3.74        3.00     0.0000    0.00%    1.741
+

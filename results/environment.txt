@@ -1,7 +1,16 @@
-date:    2026-08-27T16:28:21+01:00
-kernel:  Linux 6.18.33.2-microsoft-standard-WSL2
-cpu:     Intel(R) Core(TM) i5-8400H CPU @ 2.50GHz
+date:    2026-08-27T19:36:45+00:00
+kernel:  Linux 6.17.0-1022-gcp
+cpu:     INTEL(R) XEON(R) PLATINUM 8581C CPU @ 2.30GHz
 cores:   8 logical
-gcc:     g++ (Ubuntu 15.2.0-16ubuntu1) 15.2.0
+gcc:     g++ (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0
 governor: unavailable
-paranoid: 2
+paranoid: 1
+
+note:    the "gcc" line above is wrong. It was produced by the pre-fix
+         run_phase1.sh, which reported bare `g++` rather than the compiler CMake
+         used. The build ran with CXX=g++-14; the exact patch version was not
+         captured before the instance was deleted. scripts/run_phase1.sh now
+         reports CMAKE_CXX_COMPILER, so later runs record this correctly.
+host:    ephemeral GCP c4-standard-8 (Emerald Rapids), PMU enabled via
+         --performance-monitoring-unit=architectural. Frequency governor is not
+         exposed to the guest, which is why freq/nom varies between runs.

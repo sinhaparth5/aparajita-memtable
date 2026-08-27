@@ -48,7 +48,7 @@ has to satisfy.
 
 ## Phase 1: environment and micro-benchmarking primitives
 
-Weeks 1-2. Complete, apart from the AVX-512 runtime check. Results and analysis in
+Weeks 1-2. Complete, including the AVX-512 runtime check. Results and analysis in
 [docs/phase1.md](docs/phase1.md); reproduce with `./scripts/run_phase1.sh`.
 
 Goal: prove the SIMD search wins on a standalone kernel before any of it touches RocksDB.
@@ -71,12 +71,16 @@ choice.
 
 | Exit criterion | Target | Result |
 | --- | --- | --- |
-| Branch misses on the SIMD probe | below 0.5% of branches | met: 0.00 to 0.04% |
-| Cycles per lookup, AVX2 versus scalar | measured ratio with dispersion | met: 4.3x to 4.9x (7.0 versus 30.0 cycles/probe) |
-| AVX-512 path | correct under CPUID gating, downclocking recorded | blocked: the development host is an i5-8400H with no AVX-512, so the path is compiled and CPUID-gated but has never executed |
+| Branch misses on the SIMD probe | below 0.5% of branches | met: 0.00% for both avx2 and avx512 |
+| Cycles per lookup, SIMD versus scalar | measured ratio with dispersion | met: 5.5x (avx2) and 6.9x (avx512) at a 0.5 hit ratio, 5.01 and 4.04 versus 27.65 cycles/probe |
+| AVX-512 path | correct under CPUID gating, downclocking recorded | met: executes and passes the kernel tests; no downclock observed, freq/nom 1.741 in all five runs |
 
-The AVX-512 gap carries into Phase 4, since a paper claiming an AVX-512 result needs a machine
-that has it: Skylake-SP or newer Xeon, Ice Lake or newer client, or Zen 4.
+The AVX-512 criterion was closed on a rented Xeon Platinum 8581C (Emerald Rapids) rather than on
+the development laptop, which is an i5-11300H. Two gaps remain deliberately open. The null
+downclock result is from the generation where Intel had already removed most of the penalty, so it
+does not speak for Skylake-SP or Cascade Lake, and it was taken on a shared cloud VM where the
+guest cannot pin the governor. Confirming the negative on a downclock-prone part on bare metal is
+the remaining work, and it belongs with the Phase 4 hardware rather than here.
 
 One result changed the design rather than just measuring it. Returning -1 for "not found" costs
 about 0.5 branch mispredictions per probe, because the ternary that produces it is data-dependent
@@ -198,8 +202,13 @@ preserve order and allow a range scan to use the same kernel; a hash distributes
 the unordered design above.
 
 AVX2 as the shipped baseline with AVX-512 as an opportunistic path, or AVX-512 as a requirement.
-AVX-512 downclocks on several Intel generations and is absent from most AMD parts before Zen 4,
-which argues for AVX2 by default.
+Phase 1 weakened half the case for caution: the AVX-512 kernel is 20% faster than AVX2 (4.04
+against 5.01 cycles per probe, 15 retired instructions against 20) and showed no downclocking at
+all on Emerald Rapids, which is expected for light integer 512-bit work rather than the sustained
+FP and FMA that Intel's frequency licensing actually penalizes. Availability remains the real
+argument for an AVX2 default: AVX-512 is absent from most AMD parts before Zen 4, and Intel fused
+it off in client parts after Rocket Lake. The measured speed gap is small enough that AVX2 as the
+shipped baseline costs little.
 
 Whether to support the `MemTableRep` prefix-extractor and bloom paths, or to declare them out of
 scope in the first release.
