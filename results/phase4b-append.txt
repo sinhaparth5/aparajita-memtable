@@ -125,6 +125,17 @@ TSan needs `sysctl vm.mmap_rnd_bits=28` on Ubuntu 24.04, or it aborts at startup
 with "unexpected memory mapping" before running anything. That is the kernel's
 ASLR entropy, not a fault in the target.
 
+The 64-thread TSan case was tried here on purpose, since CLAUDE.md records it as
+the one open Phase 2 exit criterion and guesses that it needs a host with more
+cores. Doubling the cores is not enough: on sixteen it ran for 606 seconds without
+completing, on an otherwise idle machine, after 1, 4 and 16 had each finished in
+seconds. So the guess is now measured and wrong, and the cause is not core count.
+Sixty-four threads walking the key space at the same rate all pile onto one node's
+lock, and every test_and_set in the backoff loop is a TSan event, so the work grows
+with contention rather than with the key count. Closing it wants the test changed
+-- interleaved key ranges, or a smaller spin budget under instrumentation -- rather
+than a bigger machine. That belongs to Phase 4 and is out of scope here.
+
 == mutation testing, same host ==
 Eleven mutations applied to the new code, each run against all three local test
 binaries. The column is which binaries caught it.

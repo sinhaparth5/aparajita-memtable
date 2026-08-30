@@ -362,8 +362,13 @@ What Phase 3 answered, and what it left open:
 - `arena.hpp` was a stand-in written against arena semantics deliberately, and swapping in
   `rocksdb::Allocator` behind `Traits::allocate` was the substitution it was meant to be. Its single
   mutex is gone on the RocksDB path; the standalone harnesses still use it.
-- ThreadSanitizer coverage at 64 threads is still the one open Phase 2 exit criterion, and closing
-  it still needs a host with more cores rather than a change to the structure.
+- ThreadSanitizer coverage at 64 threads is still the one open Phase 2 exit criterion, but the
+  standing guess about it is now measured and wrong. It is not core count: on an idle 16-core Xeon
+  the 64-thread case ran 606 seconds without completing, having taken seconds at 1, 4 and 16. The
+  work grows with contention, not with cores -- all 64 threads walk the key space at the same rate
+  and pile onto one node's lock, and every `test_and_set` in the backoff loop is a TSan event.
+  Closing it wants the test changed, by interleaving key ranges or shortening the spin budget under
+  instrumentation, rather than a bigger machine.
 
 The development laptop is an i5-11300H (Tiger Lake) with 8 logical cores. It has AVX-512, unlike the
 i5-8400H that produced the archived results, but it runs under WSL2 where the governor is not
