@@ -5,8 +5,10 @@
 //
 // It exists now so the Phase 2 structure is written against arena semantics from
 // the start rather than being retrofitted. Two of those semantics shape the code
-// above it. Memory is bump-allocated and never individually freed, so a
-// copy-on-write node costs an allocation and nothing else. And an arena cannot
+// above it. Memory is bump-allocated and never individually freed, so a node
+// published by a split costs an allocation and nothing else -- and, since nothing
+// is reclaimed, so did every insert until Phase 4b stopped rebuilding nodes on
+// the way past. And an arena cannot
 // reallocate, so growable storage has to be segmented into chunks rather than
 // resized, which is why this hands out fresh chunks instead of growing one.
 

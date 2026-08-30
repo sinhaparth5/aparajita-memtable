@@ -172,6 +172,14 @@ void run_at(int threads) {
     std::vector<std::string> expect_vec(expect_sorted.begin(), expect_sorted.end());
     check(seen == expect_vec, std::to_string(threads) + " threads: contents match exactly");
 
+    // The writers have joined, so the structure is quiesced and the invariants
+    // that no query can observe are safe to walk. This is the only place they get
+    // checked after concurrent appends, which is where an interleaving that
+    // published an order word before the slot it names would show up.
+    if (const char* broken = table.check_invariants()) {
+        check(false, std::to_string(threads) + " threads: " + broken);
+    }
+
     std::printf("  %2d threads x %4d keys: %zu stored, %d reader hits, arena %zu KiB\n", threads,
                 kKeysPerThread, seen.size(), reader_hits.load(), arena.memory_usage() / 1024);
     // Flushed per case. Under ThreadSanitizer the last case takes long enough
