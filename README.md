@@ -12,6 +12,7 @@
 [![C++20](https://img.shields.io/badge/C%2B%2B-20-00599C.svg)](CMakeLists.txt)
 [![RocksDB](https://img.shields.io/badge/RocksDB-v9.11.2-a4243b.svg)](plugin/aparajita)
 [![Paper](https://img.shields.io/badge/paper-PDF-informational.svg)](paper/main.pdf)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.22180368.svg)](https://doi.org/10.5281/zenodo.22180368)
 
 </div>
 
@@ -118,8 +119,22 @@ Four decisions interlock, and each is argued in [`docs/`](docs) and in the paper
 
 ## Citation
 
-If you use Aparajita in academic work, please cite it. Machine-readable metadata is in
-[`CITATION.cff`](CITATION.cff), and GitHub will render a formatted citation from the sidebar.
+Archived on Zenodo with a DOI. Cite the concept DOI [`10.5281/zenodo.22180368`](https://doi.org/10.5281/zenodo.22180368) to point at
+whatever the latest version is, or [`10.5281/zenodo.22180369`](https://doi.org/10.5281/zenodo.22180369) to pin v0.5.0 specifically.
+
+```bibtex
+@software{aparajita,
+  author    = {Sinha, Parth Kumar},
+  title     = {Aparajita: A {SIMD} {MemTable} for {LSM}-Tree Key-Value Stores},
+  version   = {0.5.0},
+  doi       = {10.5281/zenodo.22180369},
+  publisher = {Zenodo},
+  year      = {2026}
+}
+```
+
+Machine-readable metadata is in [`CITATION.cff`](CITATION.cff), and GitHub renders a formatted
+citation from the sidebar.
 
 ## License
 

@@ -39,6 +39,17 @@ license:
   - MIT
 version: 0.5.0
 date-released: "2026-08-30"
+# The version DOI names this release; the concept DOI below always resolves
+# to the most recent one.
+doi: 10.5281/zenodo.22180369
+identifiers:
+  - type: doi
+    value: 10.5281/zenodo.22180368
+    description: Concept DOI, resolving to the latest version
+  - type: doi
+    value: 10.5281/zenodo.22180369
+    description: DOI for version 0.5.0
+
 
 preferred-citation:
   type: article
