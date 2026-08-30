@@ -12,6 +12,39 @@
 \usepackage{graphicx}
 \usepackage{url}
 \usepackage[hidelinks]{hyperref}
+\usepackage{tikz}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.18}
+\usetikzlibrary{positioning,fit,backgrounds,arrows.meta,calc,decorations.pathreplacing}
+
+% Okabe--Ito, which stays distinguishable under the three common forms of
+% colour blindness and survives a greyscale print. Every figure draws from this
+% list and nothing else, so a series means the same thing across figures.
+\definecolor{apaBlue}{HTML}{0072B2}   % Aparajita
+\definecolor{apaOrange}{HTML}{E69F00} % the skip list
+\definecolor{apaGreen}{HTML}{009E73}  % vector kernels, and "wins"
+\definecolor{apaRed}{HTML}{D55E00}    % scalar baselines, and "losses"
+\definecolor{apaSky}{HTML}{56B4E9}
+\definecolor{apaPurple}{HTML}{CC79A7}
+\definecolor{apaGrey}{HTML}{6E7B8B}
+\definecolor{apaPale}{HTML}{DCE3EA}
+\definecolor{apaWarm}{HTML}{F6E3C5}
+
+% One style for every plot, so the figures read as a set.
+\pgfplotsset{
+  apabase/.style={
+    tick align=outside, tick pos=left,
+    axis line style={apaGrey!70},
+    every tick/.style={apaGrey!70},
+    grid=major, grid style={apaGrey!25, line width=0.25pt},
+    label style={font=\footnotesize},
+    tick label style={font=\scriptsize},
+    legend style={font=\scriptsize, draw=apaGrey!40, fill=white,
+                  fill opacity=0.9, text opacity=1, inner sep=2pt},
+    title style={font=\footnotesize\bfseries, yshift=-2pt},
+  },
+}
+
 
 \def\BibTeX{{\rm B\kern-.05em{\sc i\kern-.025em b}\kern-.08em
     T\kern-.1667em\lower.7ex\hbox{E}\kern-.125emX}}
@@ -228,38 +261,69 @@ to a single candidate. The layout is enforced by static assertions rather than b
 comment, because the search kernel reinterprets the surrogate array as a vector
 and would silently misbehave if a field migrated into the first line.
 
-\begin{figure}[t]
-\centering\footnotesize
-\setlength{\tabcolsep}{3pt}
-\begin{tabular}{@{}rll@{}}
-\toprule
-byte & field & touched by \\
-\midrule
-\multicolumn{3}{@{}l}{\emph{\texttt{NodeData}, line 0: all a probe that misses reads}}\\
-0--59   & surrogates $s_0 \dots s_{14}$          & vector compare \\
-60--63  & sentinel lane, \texttt{0xFFFFFFFF}     & vector compare \\
-\midrule
-\multicolumn{3}{@{}l}{\emph{\texttt{NodeData}, line 1 on: read after the vector step}}\\
-64--71  & order word, rank $i$ in nibble $i$     & every reader (acquire) \\
-72--75  & \texttt{prefix\_len}                   & surrogate computation \\
-80--87  & level-0 successor                      & descent, iteration \\
-88--    & 16 key slots, 15 ever live             & comparator confirmation \\
-\midrule
-\multicolumn{3}{@{}l}{\emph{\texttt{ListNode}, its own line: the index above level 0}}\\
-0--7    & payload pointer                        & swapped by a split \\
-8--15   & \texttt{first\_hint}, 8 key bytes      & every tower hop \\
-16--    & write lock, height, tower              & writers, descent \\
-\bottomrule
-\end{tabular}
-\caption{Node layout. The split at offset 64 is what makes a probe that finds
-nothing cost one line fill: the order word, the prefix length, the successor and
-the key pointers are all reached only once the vector step has narrowed the answer
-to a candidate. The successor and the order word live inside \texttt{NodeData}
-rather than beside the tower so that a split can replace contents and successor in
-one release store. Offsets are enforced by static assertion, since the search
-kernel reinterprets bytes 0--63 as a vector.}
+\begin{figure*}[t]
+\centering
+\resizebox{\textwidth}{!}{%
+\begin{tikzpicture}[
+  x=1cm, y=1cm,
+  cell/.style={draw=apaGrey!60, line width=0.5pt, minimum height=0.86cm, inner sep=0pt,
+               font=\scriptsize, anchor=south west},
+  hot/.style={cell, fill=apaBlue!22},
+  sent/.style={cell, fill=apaPale, draw=apaGrey, dashed},
+  cold/.style={cell, fill=apaWarm},
+  tag/.style={font=\scriptsize\bfseries, anchor=west},
+  note/.style={font=\scriptsize\itshape, text=apaGrey!140, anchor=west},
+  byte/.style={font=\tiny, text=apaGrey, anchor=north},
+]
+
+% ---- line 0: the sixteen lanes the vector compare reads -------------------
+\node[tag] at (0,3.95) {\textcolor{apaBlue}{\texttt{NodeData} bytes 0--63} --- one cache line, and everything a probe that misses reads};
+\foreach \i in {0,...,14}{
+  \node[hot, minimum width=1cm] at (\i,3) {$s_{\i}$};
+}
+\node[sent, minimum width=1cm] at (15,3) {\textsc{sent}};
+\node[byte] at (0,2.94) {0};
+\node[byte] at (8,2.94) {32};
+\node[byte] at (16,2.94) {64};
+\draw[decorate, decoration={brace, amplitude=4pt, mirror}, apaBlue, line width=0.6pt]
+  (0,2.62) -- (16,2.62) node[midway, below=4pt, font=\scriptsize, text=apaBlue]
+  {one \texttt{vmovdqu} / \texttt{vmaskmovps}, one relational compare, one \texttt{popcnt} $\Rightarrow$ the lower bound};
+
+% ---- line 1 on: the cold fields ------------------------------------------
+\node[tag] at (0,1.75) {\textcolor{apaRed}{\texttt{NodeData} bytes 64 on} --- reached only once the vector step has named a candidate};
+\node[cold, minimum width=2cm] at (0,0.8)  {order word};
+\node[cold, minimum width=1cm] at (2,0.8)  {\texttt{plen}};
+\node[cell, minimum width=1cm, fill=white] at (3,0.8) {\textcolor{apaGrey}{pad}};
+\node[cold, minimum width=2cm] at (4,0.8)  {level-0 \texttt{next}};
+\node[cold, minimum width=10cm] at (6,0.8) {16 key slots, 15 ever live --- comparator confirmation};
+\node[byte] at (0,0.74) {64};
+\node[byte] at (2,0.74) {72};
+\node[byte] at (4,0.74) {80};
+\node[byte] at (6,0.74) {88};
+\node[note] at (0.06,0.30) {order word: rank $i$ in nibble $i$, holding \texttt{slot}$+1$, so one release store publishes an insert};
+\node[note] at (0.06,-0.05) {\texttt{next} lives inside the payload, so a split replaces contents and successor together};
+
+% ---- ListNode ------------------------------------------------------------
+\node[tag] at (0,-1.00) {\textcolor{apaGreen}{\texttt{ListNode}} --- the index above level 0, an accelerator and never the truth};
+\node[cell, minimum width=2cm, fill=apaGreen!18] at (0,-1.98) {payload \texttt{*}};
+\node[cell, minimum width=2cm, fill=apaGreen!30] at (2,-1.98) {\texttt{first\_hint}};
+\node[cell, minimum width=12cm, fill=apaGreen!10] at (4,-1.98) {write lock, height, forward tower (branching factor 4)};
+\node[byte] at (0,-2.04) {0};
+\node[byte] at (2,-2.04) {8};
+\node[byte] at (4,-2.04) {16};
+\node[note] at (2.06,-2.42) {8 key bytes: a tower hop compares two integers in a line it has already loaded};
+
+\end{tikzpicture}}
+\caption{Node layout, drawn to scale in bytes. The split at offset 64 is what makes a
+probe that finds nothing cost one line fill: the order word, the prefix length, the
+successor and the key pointers are all reached only once the vector step has narrowed
+the answer to a candidate. The successor and the order word live inside
+\texttt{NodeData} rather than beside the tower so that a split can replace contents and
+successor in one release store; moving either out would expose a state in which a key is
+duplicated across both halves or missing from both. Offsets are enforced by static
+assertion, since the search kernel reinterprets bytes 0--63 as a vector.}
 \label{fig:layout}
-\end{figure}
+\end{figure*}
 
 \subsection{Branchless ordered search}
 \label{sec:kernel}
@@ -299,6 +363,53 @@ kernels only. Folding absence into the compare mask
 removes the conditional, and for the ordered kernel the convention falls out of the
 population count for free.
 
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  apabase,
+  width=0.86\columnwidth, height=6.0cm,
+  xbar, bar width=5pt,
+  xmode=log, log basis x=10,
+  xmin=0.3, xmax=1200000,
+  enlarge y limits=0.08,
+  symbolic y coords={{\texttt{db\_bench} default}, {single table prefix},
+                     {decimal, fixed stem}, {big-endian timestamp},
+                     {big-endian sequential}, {tenant-prefixed}, {hex UUID},
+                     {uniform random}},
+  ytick=data,
+  xlabel={expected full-key comparisons per lookup},
+  xtick={1,10,100,1000,10000,100000},
+  xticklabels={1,10,100,$10^3$,$10^4$,$10^5$},
+  xmajorgrids=true, ymajorgrids=false,
+  legend style={at={(0.98,0.97)}, anchor=north east},
+]
+\addplot[draw=apaRed!80!black, fill=apaRed!85] coordinates {
+  (200000,{\texttt{db\_bench} default}) (200000,{single table prefix})
+  (200000,{decimal, fixed stem}) (200000,{big-endian timestamp})
+  (200000,{big-endian sequential}) (201,{tenant-prefixed})
+  (4,{hex UUID}) (1,{uniform random})};
+\addplot[draw=apaGreen!80!black, fill=apaGreen!85] coordinates {
+  (1,{\texttt{db\_bench} default}) (1,{single table prefix})
+  (1,{decimal, fixed stem}) (1,{big-endian timestamp})
+  (1,{big-endian sequential}) (1.1,{tenant-prefixed})
+  (1,{hex UUID}) (1,{uniform random})};
+\legend{absolute surrogate, prefix-relative surrogate}
+\end{axis}
+\end{tikzpicture}
+\caption{Why the surrogate is taken after the node's shared prefix, at $N = 200{,}000$
+keys per distribution. A bar stopping at the 1 line is a perfect lane, one full-key
+comparison per lookup; a bar reaching $N$ is a lane holding one value for the whole keyspace, which
+discriminates nothing and degenerates the vector step into a linear scan confirmed key by
+key. An absolute lane collapses on five of the eight distributions, including
+\texttt{db\_bench}'s own key encoding, which is the keyspace every RocksDB measurement in
+this paper runs on. Only uniformly random binary keys leave it effective, and no
+production keyspace looks like that. Log scale; the absolute values are 1.0,
+4.0, 201.0, and 200{,}000.0 exactly on the remaining five, and the prefix-relative
+values are 1.0 everywhere except tenant-prefixed, at 1.1.}
+\label{fig:surrogate}
+\end{figure}
+
 \subsection{Prefix-relative surrogates}
 \label{sec:surrogate}
 
@@ -310,30 +421,9 @@ two surrogates reproduce RocksDB's default bytewise \texttt{memcmp} order. Keys
 shorter than four bytes pad with \texttt{0x00}, because a prefix sorts before any
 key extending it.
 
-\begin{table}[t]
-\caption{Expected full-key comparisons per lookup, $\sum_i m_i^2 / N$ over
-         surrogate multiplicities, at $N = 200{,}000$ keys. 1.0 is a perfect lane;
-         $N$ itself means the lane holds one value for the whole keyspace.}
-\label{tab:surrogate}
-\centering\small\setlength{\tabcolsep}{4pt}
-\begin{tabular}{lrr}
-\toprule
-key distribution & absolute & prefix-relative \\
-\midrule
-uniform random binary      &      1.0 & 1.0 \\
-hex UUID                   &      4.0 & 1.0 \\
-tenant-prefixed            &    201.0 & 1.1 \\
-big-endian sequential      & 200000.0 & 1.0 \\
-big-endian timestamp       & 200000.0 & 1.0 \\
-decimal with a fixed stem  & 200000.0 & 1.0 \\
-single table prefix        & 200000.0 & 1.0 \\
-\texttt{db\_bench} default & 200000.0 & 1.0 \\
-\bottomrule
-\end{tabular}
-\end{table}
 
 Taking those four bytes from the start of the key does not work, and measurement
-is what established it. Table~\ref{tab:surrogate} reports the expected number of
+is what established it. Figure~\ref{fig:surrogate} reports the expected number of
 full-key comparisons a lookup performs, over eight key distributions at 200{,}000
 keys each. An absolute surrogate takes a single value across the entire keyspace in
 five of them, because a table name prefix, a tenant identifier or a big-endian
@@ -361,7 +451,7 @@ surrogate in the node. And a key that does not share the node's prefix has no
 meaningful surrogate at that offset, so it is placed by full comparison instead;
 such a key is provably outside the node's range rather than inside it, so its lane
 saturates in the direction it sorts. The right-hand column of
-Table~\ref{tab:surrogate} is that design, and it restores every distribution to an
+The second series in Figure~\ref{fig:surrogate} is that design, and it restores every distribution to an
 effective lane, the worst at 1.1 comparisons per lookup.
 
 The surrogate is a candidate and never an answer. Bytewise order on the user key
@@ -373,6 +463,74 @@ fallback when confirmation fails. Four deliberately introduced kernel bugs passe
 a full differential test against RocksDB's skip list because of this
 confirmation, which is why the kernels also carry direct unit tests against a
 scalar reference.
+
+\begin{figure}[t]
+\centering
+\resizebox{\columnwidth}{!}{%
+\begin{tikzpicture}[
+  x=1cm, y=1cm,
+  slot/.style={draw=apaGrey!60, line width=0.5pt, minimum width=1.2cm,
+               minimum height=0.8cm, inner sep=0pt, font=\small\ttfamily, anchor=south west},
+  live/.style={slot, fill=apaBlue!18},
+  fresh/.style={slot, fill=apaGreen!30, draw=apaGreen!70!black, line width=0.8pt},
+  free/.style={slot, fill=white, text=apaGrey},
+  nib/.style={slot, minimum height=0.7cm, font=\small\ttfamily, fill=apaWarm},
+  nibz/.style={nib, fill=white, text=apaGrey},
+  idx/.style={font=\tiny, text=apaGrey, anchor=north},
+  hdr/.style={font=\scriptsize\bfseries, anchor=west},
+  note/.style={font=\scriptsize\itshape, text=apaGrey!140, anchor=west},
+  hop/.style={->, >={Stealth[length=3.2pt]}, apaGrey!75, line width=0.45pt},
+]
+
+% ---- the slots, in the order the writers happened to arrive ---------------
+\node[hdr] at (0,4.05) {Slots, in the order they were written --- \texttt{bee} landed in slot 4 before any rank named it};
+\foreach \k/\w in {0/dog, 1/ant, 3/cat}{
+  \node[live] at ({\k*1.3},3.1) {\w};
+}
+\node[live] at (2.6,3.1) {fig};
+\node[fresh] at (5.2,3.1) {bee};
+\node[free] at (6.5,3.1) {--};
+\foreach \k/\lbl in {0/0, 1/1, 2/2, 3/3, 4/4, 5/5}{
+  \node[idx] at ({\k*1.3+0.6},3.04) {slot \lbl};
+}
+
+% ---- the order word -------------------------------------------------------
+\node[hdr] at (0,1.95) {Order word: rank $i$ in nibble $i$, holding \texttt{slot}$+1$};
+\node[nib] at (0,1.1)   {2};
+\node[nib, fill=apaGreen!30, draw=apaGreen!70!black, line width=0.8pt] at (1.3,1.1) {5};
+\node[nib] at (2.6,1.1) {4};
+\node[nib] at (3.9,1.1) {1};
+\node[nib] at (5.2,1.1) {3};
+\node[nibz] at (6.5,1.1) {0};
+\foreach \k/\lbl in {0/0, 1/1, 2/2, 3/3, 4/4, 5/5}{
+  \node[idx] at ({\k*1.3+0.6},1.04) {rank \lbl};
+}
+\node[note] at (0.06,0.62) {ranks 6--15 are all \texttt{0}, and \texttt{0} decodes to slot 15 --- the one lane every node keeps at the sentinel};
+
+% ---- which nibble names which slot ---------------------------------------
+\foreach \r/\s in {0/1, 1/4, 2/3, 3/0, 4/2}{
+  \draw[hop] ({\r*1.3+0.6},1.85) to[out=90, in=-90] ({\s*1.3+0.6},3.06);
+}
+
+% ---- what a reader gets --------------------------------------------------
+\node[hdr] at (0,0.0) {What one acquire load of that word yields};
+\foreach \k/\w in {0/ant, 1/bee, 2/cat, 3/dog, 4/fig}{
+  \node[live, fill=apaSky!25] at ({\k*1.3},-1.0) {\w};
+}
+\node[note] at (0.06,-1.42) {sorted, and frozen: the word is self-describing, so its highest nonzero nibble is the count};
+
+\end{tikzpicture}}
+\caption{An insert as two stores into a free slot and one release store of the order word.
+Slot order is arrival order and is never rearranged, so nothing already visible moves and a
+reader that takes one acquire load of the word holds a consistent node: everything the word
+names is frozen. A nibble holds \texttt{slot}$+1$ rather than the slot, which costs one of
+the sixteen slots and buys two things --- the word is self-describing, so no count needs a
+second store beside it, and an unused rank decodes to slot 15, the one lane every node keeps
+at the sentinel, so a short node is padded for free. The lower-bound kernel reads only the
+count from this word: a population count over a set does not depend on how the set is
+arranged, which is why the shipped kernel never undoes the permutation.}
+\label{fig:order}
+\end{figure}
 
 \subsection{Append-only nodes and the order word}
 \label{sec:append}
@@ -579,6 +737,46 @@ differ only in operation count, with an identical fill at an identical seed, so
 everything that is not the extra operations cancels exactly. Reads difference
 20{,}000{,}000 against 2{,}000{,}000 and writes 2{,}000{,}000 against 200{,}000.
 
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  apabase,
+  width=0.90\columnwidth, height=4.9cm,
+  xbar, bar width=7pt,
+  enlarge y limits=0.30,
+  clip=false,
+  symbolic y coords={AVX-512, AVX2, scalar branchy},
+  ytick=data,
+  xmin=0, xmax=62,
+  xlabel={cycles per probe},
+  xmajorgrids=true, ymajorgrids=false,
+  legend style={at={(0.98,0.06)}, anchor=south east},
+  nodes near coords, nodes near coords style={font=\tiny},
+  every node near coord/.append style={/pgf/number format/fixed,
+                     /pgf/number format/precision=2, anchor=west, xshift=1pt},
+]
+\addplot[draw=apaGreen!80!black, fill=apaGreen!85]
+  coordinates {(4.03,AVX-512) (5.10,AVX2) (40.14,scalar branchy)};
+\addplot[draw=apaBlue!80!black, fill=apaBlue!45]
+  coordinates {(6.04,AVX-512) (9.89,AVX2) (49.49,scalar branchy)};
+\legend{sorted node (reference), append-only node (shipped)}
+\draw[apaRed, dashed, line width=0.8pt]
+  ({axis cs:8.67,AVX-512}|-{rel axis cs:0,0}) -- ({axis cs:8.67,AVX-512}|-{rel axis cs:0,1});
+\node[font=\tiny, text=apaRed, anchor=south west, xshift=1pt, yshift=1.5pt]
+  at ({axis cs:8.67,AVX-512}|-{rel axis cs:0,1}) {branchless scalar, sorted node: 8.67};
+\end{axis}
+\end{tikzpicture}
+\caption{Kernel cost over one 16-lane node, 200{,}000 probes, median of nine repetitions.
+The vector kernels retire zero branch mispredictions per probe at any hit ratio; the branchy
+scalar baselines retire about one. The gap between the two series is not slack but the
+live-lane mask, which exists because a writer is storing into the slot the kernel is
+reading. The dashed line is a branchless scalar lower bound over a sorted node: on an
+AVX2-only host the shipped kernel clears it by less than a cycle, which is the honest
+statement of what SIMD buys on that ISA.}
+\label{fig:kernels}
+\end{figure}
+
 \subsection{Search kernels in isolation}
 
 Table~\ref{tab:kernels} reports the kernels over 200{,}000 probes at a 0.5 hit
@@ -641,6 +839,47 @@ than 5.01 and 4.04, inverting which ISA is faster while retained instruction
 counts stay at 20 and 15. The ordered families reproduce across those same two
 runs to within 0.2 cycles, so we quote the ordered rows and make no claim about
 the relative speed of the two ISAs on equality search.
+
+\begin{figure*}[t]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  apabase,
+  width=0.985\textwidth, height=6.2cm,
+  ybar=1.1pt, bar width=8.5pt,
+  enlarge x limits=0.13,
+  symbolic x coords={1 thread, 4 threads, 16 threads, 64 threads},
+  xtick=data,
+  ymin=-14, ymax=46,
+  ytick={-10,0,10,20,30,40},
+  yticklabel={\pgfmathprintnumber{\tick}\,\%},
+  ylabel={throughput against the skip list},
+  grid=both, ymajorgrids=true, xmajorgrids=false,
+  legend columns=5,
+  legend style={at={(0.5,1.02)}, anchor=south, draw=none, fill=none, column sep=1ex},
+  minor y tick num=1,
+]
+\draw[apaGrey!70, line width=0.7pt] ({rel axis cs:0,0}|-{axis cs:1 thread,0})
+   -- ({rel axis cs:1,0}|-{axis cs:1 thread,0});
+\addplot[draw=apaBlue!80!black, fill=apaBlue!85]   coordinates {(1 thread,38.6) (4 threads,37.3) (16 threads,22.2) (64 threads,25.8)};
+\addplot[draw=apaSky!70!black, fill=apaSky!85]     coordinates {(1 thread,35.8) (4 threads,38.1) (16 threads,29.0) (64 threads,22.8)};
+\addplot[draw=apaGreen!80!black, fill=apaGreen!85] coordinates {(1 thread,28.6) (4 threads,27.4) (16 threads,17.2) (64 threads,15.1)};
+\addplot[draw=apaOrange!80!black, fill=apaOrange!85] coordinates {(1 thread,18.8) (4 threads,2.6) (16 threads,-3.0) (64 threads,0.6)};
+\addplot[draw=apaRed!80!black, fill=apaRed!85]     coordinates {(1 thread,-3.0) (4 threads,-3.3) (16 threads,-4.3) (64 threads,-3.8)};
+\legend{\texttt{readrandom}, \texttt{readwhilewriting}, \texttt{seekrandom} (seek alone),
+        \texttt{fillrandom}, \texttt{seekrandom} (seek $+$ 10\,\texttt{Next})}
+\end{axis}
+\end{tikzpicture}
+\caption{Every \texttt{db\_bench} result in this paper, as throughput against RocksDB's
+default skip list on the same host and the same build. Positive is faster. The three read
+workloads win at every thread count with non-overlapping samples, and the two that do not
+are the ones the design pays for: iteration, where the skip list's \texttt{Next} is one
+pointer load and ours decodes a rank, and multi-threaded \texttt{fillrandom}, where
+neither representation scales because RocksDB's write-thread group dominates both
+(Section~\ref{sec:writes}). Read cells are medians of five runs, fill cells of ten; the
+underlying numbers are in Tables~\ref{tab:reads}--\ref{tab:writes}.}
+\label{fig:speedup}
+\end{figure*}
 
 \subsection{Point lookups}
 
@@ -732,7 +971,7 @@ position and walking from it.
 
 \begin{table}[t]
 \caption{\texttt{seekrandom} throughput, kops/s, WAL off, over a resident MemTable.
-         Median of five runs. \emph{nexts} is the number of \texttt{Next} calls
+         Median of five runs. The \texttt{nexts} column is the number of \texttt{Next} calls
          issued after each \texttt{Seek}.}
 \label{tab:seeks}
 \centering\footnotesize\setlength{\tabcolsep}{4pt}

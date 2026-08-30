@@ -533,20 +533,6 @@ the first release: Phase 3 shipped without them, so the rep inherits the base cl
 `GetDynamicPrefixIterator`, which is the full iterator. That is correct but gives up the skiplist's
 prefix-bloom short-circuit, and it stays a deliberate omission rather than a settled answer.
 
-## The architecture document
-
-`High Performance C++ System Architecture.md` predates the project scope and mostly does not apply.
-A `MemTableRep` runs inside RocksDB's thread and I/O model, so the document's thread-per-core
-execution model, io_uring and SQPOLL work, and write-ahead-log phase belong to RocksDB rather than
-to this plugin. What remains useful is the microarchitectural material: cache line alignment and
-false sharing, Struct of Arrays layout, static dispatch over virtual calls, and the `perf`
-methodology.
-
-Two quirks when reading it. Its numeric targets are broken image references (`![][image20]` through
-`![][image27]`), so those numbers are unrecoverable from the file; the sole surviving figure is a
-98.5% L1 hit rate. Its trailing digits on sentences (`...cache affinity1.`) are citation markers
-pointing at the "Works cited" list at the end.
-
 ## Other agent configs
 
 A Codex config exists at `~/.codex/config.toml`. To bring its MCP servers, commands, or
