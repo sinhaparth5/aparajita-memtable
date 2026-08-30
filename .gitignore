@@ -21,3 +21,18 @@ CMakeUserPresets.json
 # Build output
 build/
 cmake-build-*/
+
+# The bare Makefile rule above is CMake's. The paper's is hand-written.
+!paper/Makefile
+
+# LaTeX build products
+paper/*.aux
+paper/*.bbl
+paper/*.blg
+paper/*.log
+paper/*.out
+paper/*.fls
+paper/*.fdb_latexmk
+paper/*.synctex.gz
+paper/main.pdf
+paper/arxiv-submission.tar.gz
