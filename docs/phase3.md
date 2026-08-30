@@ -111,7 +111,15 @@ that the kernel is a smaller share of a lookup than the project has been assumin
 A 500k-key memtable holds roughly 60k nodes, since copy-on-write splits leave
 nodes about half full. The tower descent to reach the right node is therefore
 about eight hops, and every hop calls the comparator virtually on a full
-variable-length internal key. The SIMD kernel then replaces what would have been
+variable-length internal key.
+
+> **Correction, Phase 4a.** Both numbers in that sentence are wrong, and
+> instrumenting the structure rather than reasoning about it says so: 500,000
+> keys make 44,378 nodes at an average fill of 11.3 of 16, and a lookup examines
+> **30 successors**, not eight. The error was counting levels instead of hops —
+> each level of a skiplist is walked, not jumped, so the cost is
+> `(1/p)·log_{1/p} n`, about 30 at branching factor four. The conclusion below
+> survives and is in fact understated; see [phase4-descent.md](phase4-descent.md). The SIMD kernel then replaces what would have been
 at most four comparisons inside one sixteen-key node. **The design accelerates the
 last eighth of the search and leaves the other seven eighths as ordinary
 pointer-chasing with virtual comparator calls.** Against `InlineSkipList`, which

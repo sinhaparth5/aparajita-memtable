@@ -61,6 +61,33 @@ inline std::uint32_t surrogate_at(std::string_view key, std::size_t offset) noex
     return surrogate(key.data() + offset, key.size() - offset);
 }
 
+// The 64-bit value a tower hop compares, taken from the front of the order bytes.
+//
+// This is the descent's counterpart to the node-local surrogate, and it answers a
+// different question, so it is built differently. A surrogate is compared only
+// against others inside one node, which is what lets it strip that node's shared
+// prefix. A descent hint is compared across nodes, so it can strip nothing and
+// must be taken from byte zero.
+//
+// Eight bytes rather than four because the hint has no confirmation step that is
+// cheaper than the thing it replaces: a tie costs a full virtual comparator call
+// on the key it was meant to avoid touching. Four bytes tie far too often on the
+// shared table and tenant prefixes bench/collision_report.cpp measures.
+//
+// Big-endian and zero-padded for the same reason surrogate() is. Zero padding is
+// order-preserving under bytewise comparison because a prefix sorts before every
+// key extending it, and a real 0x00 byte at that position compares equal to the
+// padding, which is exactly the "undecided in the first eight bytes" answer the
+// caller falls back on.
+inline std::uint64_t descent_hint(std::string_view key) noexcept {
+    const std::size_t n = key.size() < 8 ? key.size() : 8;
+    std::uint64_t h = 0;
+    for (std::size_t i = 0; i < n; ++i) {
+        h = (h << 8) | static_cast<std::uint8_t>(key[i]);
+    }
+    return h << (8 * (8 - n));
+}
+
 // Length of the longest common prefix. Over a sorted run this need only be
 // computed for the first and last key: everything between shares at least that.
 inline std::size_t common_prefix_len(std::string_view a, std::string_view b) noexcept {

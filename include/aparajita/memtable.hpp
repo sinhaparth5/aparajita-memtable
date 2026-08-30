@@ -50,9 +50,20 @@
 //   int compare(Entry, Entry) const;               authoritative order
 //   int compare(Entry, Target) const;              same, against a lookup key
 //   static Entry null_entry();
+//   bool hint_ordering() const;                    see below
 //
 // When Entry and Target are the same type the two overloads collapse into one,
 // which is the case for both traits that exist today.
+//
+// hint_ordering() is the one member that is a promise rather than a mechanism.
+// It asserts that comparing two keys' order bytes bytewise agrees in sign with
+// compare() whenever those bytes differ in their first eight, which is what lets
+// descend() answer a tower hop from an integer in the node header instead of a
+// virtual call on the key. It is true for a memcmp order and for RocksDB's
+// default bytewise user comparator, and false for anything else, including a
+// reverse comparator. Getting it wrong is not a slow path, it is a wrong answer,
+// so a traits that cannot establish the property must return false; the descent
+// then falls back to the comparator at every hop and is merely slower.
 
 #include "aparajita/arena.hpp"
 #include "aparajita/node.hpp"
@@ -107,9 +118,27 @@ inline constexpr int kMaxHeight = 12;
 // search only follows a pointer to a node whose first key is <= the target, and
 // since nodes are ordered and never removed, any node it skips cannot have held
 // the target.
+//
+// first_hint is the descent's whole point. A hop used to cost two dependent
+// misses and a virtual call: load the successor's NodeData, reach past the
+// surrogate line to keys[0], then hand a length-prefixed internal key to the
+// comparator. The hint answers the same question from a 64-bit integer sitting in
+// the node header the hop has already loaded, and only ties fall through to the
+// old path. See descent_hint() for what it holds and BasicMemTable::descend() for
+// why a tie is the only case that can be wrong.
+//
+// It is written before the node is published and then, for every node except the
+// head, never again: descend() returns the last node whose first key is <= the
+// key being inserted, so an insert into a non-head node always sorts at position
+// 1 or later, and a split leaves the left half's first key alone. The head is the
+// sole exception, because it is what descend() falls back to for a key below
+// everything in the structure. That is harmless for a different reason: the head
+// is where every descent starts and is never a node a hop moves *to*, so its hint
+// is never read.
 template <class Traits>
 struct alignas(kCacheLine) BasicListNode {
     std::atomic<BasicNodeData<Traits>*> data{nullptr};
+    std::atomic<std::uint64_t> first_hint{0};
     std::atomic_flag write_lock = ATOMIC_FLAG_INIT;
     std::uint8_t height{1};
     std::atomic<BasicListNode<Traits>*> tower[kMaxHeight] = {};
@@ -131,11 +160,15 @@ public:
                   "cold fields must begin on the second line, not share the compared one");
     static_assert(alignof(NodeData) == kCacheLine, "node data must be cache-line aligned");
     static_assert(alignof(ListNode) == kCacheLine, "nodes must not share a cache line");
+    static_assert(offsetof(ListNode, first_hint) < kCacheLine,
+                  "the descent hint must share the line a hop already loads, or it "
+                  "trades a comparator call for the cache miss it was removing");
 
-    explicit BasicMemTable(Traits traits) : traits_(traits) {
+    explicit BasicMemTable(Traits traits)
+        : traits_(traits), hints_(traits_.hint_ordering()) {
         head_ = create_node();
         head_->height = kMaxHeight;
-        head_->data.store(fresh_data(), std::memory_order_release);
+        publish(head_, fresh_data());
     }
 
     BasicMemTable(const BasicMemTable&) = delete;
@@ -339,6 +372,31 @@ private:
         return new (p) ListNode();
     }
 
+    // Publishes a payload, hint first.
+    //
+    // The order is load-bearing in one direction. A node's first key never rises
+    // (see BasicListNode), so a reader that catches the new hint beside the old
+    // payload holds a hint no larger than either payload's first key, and a hint
+    // that is too small only ever lets a hop enter a node it was already entitled
+    // to enter. Storing the payload first would expose the opposite: the old,
+    // larger hint beside the new payload, which would make a hop stop one node
+    // short of the key it wanted.
+    //
+    // The comparison before the store is not an optimisation of the store itself,
+    // which is to a line the caller is about to dirty anyway. It is there because
+    // the hint is immutable for every node but the head, and writing a value that
+    // never changes on every insert would make that invariant harder to trust
+    // when reading the code.
+    void publish(ListNode* n, NodeData* nd) const {
+        if (nd->count > 0) {
+            const std::uint64_t h = descent_hint(traits_.order_bytes(nd->keys[0]));
+            if (n->first_hint.load(std::memory_order_relaxed) != h) {
+                n->first_hint.store(h, std::memory_order_release);
+            }
+        }
+        n->data.store(nd, std::memory_order_release);
+    }
+
     NodeData* fresh_data() {
         NodeData* d = reinterpret_cast<NodeData*>(
             traits_.allocate(sizeof(NodeData), alignof(NodeData)));
@@ -353,8 +411,25 @@ private:
     }
 
     // True when `n` begins at or below `key`, and so may still be walked past.
+    //
+    // `hint` is descent_hint() of the key's order bytes, computed once per search
+    // rather than once per hop. When the traits promise hint ordering and the two
+    // hints differ, their order *is* the answer and neither the successor's
+    // payload nor the comparator is touched. Only a tie is ambiguous, and a tie
+    // falls through to exactly the code that ran before.
+    //
+    // The relaxed load is sufficient because reachability already orders it: a
+    // reader only holds `n` at all by way of an acquire load on a tower pointer
+    // or on a predecessor's payload, and publish() writes the hint before either
+    // of those becomes visible.
     template <class K>
-    bool starts_at_or_below(const ListNode* n, K key) const {
+    bool starts_at_or_below(const ListNode* n, K key, std::uint64_t hint) const {
+        if (hints_) {
+            const std::uint64_t h = n->first_hint.load(std::memory_order_relaxed);
+            if (h != hint) {
+                return h < hint;
+            }
+        }
         const NodeData* d = n->data.load(std::memory_order_acquire);
         return d->count > 0 && traits_.compare(d->keys[0], key) <= 0;
     }
@@ -363,12 +438,13 @@ private:
     // only node that may contain it. Descends the tower first, then finishes on
     // the authoritative level-0 links.
     template <class K>
-    ListNode* descend(K key, std::string_view /*bytes*/) const {
+    ListNode* descend(K key, std::string_view bytes) const {
+        const std::uint64_t hint = hints_ ? descent_hint(bytes) : 0;
         ListNode* cur = head_;
         for (int lv = kMaxHeight - 1; lv >= 1; --lv) {
             for (;;) {
                 ListNode* nx = cur->tower[lv].load(std::memory_order_acquire);
-                if (nx != nullptr && starts_at_or_below(nx, key)) {
+                if (nx != nullptr && starts_at_or_below(nx, key, hint)) {
                     cur = nx;
                     continue;
                 }
@@ -378,7 +454,7 @@ private:
         for (;;) {
             const NodeData* d = cur->data.load(std::memory_order_acquire);
             ListNode* nx = d->next;
-            if (nx != nullptr && starts_at_or_below(nx, key)) {
+            if (nx != nullptr && starts_at_or_below(nx, key, hint)) {
                 cur = nx;
                 continue;
             }
@@ -398,11 +474,13 @@ private:
             return nullptr;
         }
         const Entry first = d->keys[0];
+        const std::uint64_t hint =
+            hints_ ? descent_hint(traits_.order_bytes(first)) : 0;
         const ListNode* cur = head_;
         for (int lv = kMaxHeight - 1; lv >= 1; --lv) {
             for (;;) {
                 const ListNode* nx = cur->tower[lv].load(std::memory_order_acquire);
-                if (nx != nullptr && nx != n && starts_strictly_below(nx, first)) {
+                if (nx != nullptr && nx != n && starts_strictly_below(nx, first, hint)) {
                     cur = nx;
                     continue;
                 }
@@ -412,7 +490,7 @@ private:
         for (;;) {
             const NodeData* cd = cur->data.load(std::memory_order_acquire);
             const ListNode* nx = cd->next;
-            if (nx != nullptr && nx != n && starts_strictly_below(nx, first)) {
+            if (nx != nullptr && nx != n && starts_strictly_below(nx, first, hint)) {
                 cur = nx;
                 continue;
             }
@@ -420,7 +498,13 @@ private:
         }
     }
 
-    bool starts_strictly_below(const ListNode* n, Entry key) const {
+    bool starts_strictly_below(const ListNode* n, Entry key, std::uint64_t hint) const {
+        if (hints_) {
+            const std::uint64_t h = n->first_hint.load(std::memory_order_relaxed);
+            if (h != hint) {
+                return h < hint;
+            }
+        }
         const NodeData* d = n->data.load(std::memory_order_acquire);
         return d->count > 0 && traits_.compare(d->keys[0], key) < 0;
     }
@@ -448,12 +532,12 @@ private:
 
     // The last node at or above level `lv` whose first key is <= `key`. Used to
     // find where a freshly split sibling belongs in each tower level.
-    ListNode* pred_at_level(int lv, Entry key) const {
+    ListNode* pred_at_level(int lv, Entry key, std::uint64_t hint) const {
         ListNode* cur = head_;
         for (int l = kMaxHeight - 1; l >= lv; --l) {
             for (;;) {
                 ListNode* nx = cur->tower[l].load(std::memory_order_acquire);
-                if (nx != nullptr && starts_at_or_below(nx, key)) {
+                if (nx != nullptr && starts_at_or_below(nx, key, hint)) {
                     cur = nx;
                     continue;
                 }
@@ -476,14 +560,16 @@ private:
     // Best-effort. If a level cannot be linked the node is still reachable on
     // level 0, so this loop is allowed to give up without breaking anything.
     void link_tower(ListNode* node, Entry first_key) {
+        const std::uint64_t hint =
+            hints_ ? descent_hint(traits_.order_bytes(first_key)) : 0;
         for (int lv = 1; lv < node->height; ++lv) {
             for (int attempt = 0; attempt < 8; ++attempt) {
-                ListNode* pred = pred_at_level(lv, first_key);
+                ListNode* pred = pred_at_level(lv, first_key, hint);
                 if (pred == node) {
                     break;
                 }
                 ListNode* nx = pred->tower[lv].load(std::memory_order_acquire);
-                if (nx != nullptr && starts_at_or_below(nx, first_key)) {
+                if (nx != nullptr && starts_at_or_below(nx, first_key, hint)) {
                     continue;  // someone linked ahead of us; re-find
                 }
                 node->tower[lv].store(nx, std::memory_order_release);
@@ -607,7 +693,7 @@ private:
         const int n = merge(d, key, bytes, merged);
         NodeData* nd = fresh_data();
         fill(nd, merged, n, d->next);
-        cur->data.store(nd, std::memory_order_release);
+        publish(cur, nd);
     }
 
     // A full node becomes two. The right half is published as a brand new node
@@ -630,9 +716,9 @@ private:
         // height included. Writing a plain field after publication would be a
         // race even if no reader happens to look at it today.
         sibling->height = static_cast<std::uint8_t>(random_height());
-        sibling->data.store(right, std::memory_order_release);
+        publish(sibling, right);
 
-        cur->data.store(left, std::memory_order_release);
+        publish(cur, left);
 
         // Only now, once the sibling is reachable on level 0, is it safe to index
         // it. A tower pointer to a node no one can reach on level 0 would let a
@@ -641,6 +727,9 @@ private:
     }
 
     Traits traits_;
+    // Cached because descend() consults it on every hop and the answer cannot
+    // change: a comparator is fixed for the lifetime of a memtable.
+    bool hints_;
     ListNode* head_;
 };
 
@@ -662,6 +751,10 @@ public:
     static std::string_view order_bytes(std::string_view e) { return e; }
     static int compare(std::string_view a, std::string_view b) { return compare_keys(a, b); }
     static Entry null_entry() { return std::string_view(); }
+
+    // compare() is compare_keys(), which is memcmp with a length tiebreak, so
+    // bytewise order on the first eight bytes agrees with it by construction.
+    static bool hint_ordering() { return true; }
 
     Arena& arena() const { return *arena_; }
 

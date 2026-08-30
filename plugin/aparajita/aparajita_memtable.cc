@@ -28,11 +28,55 @@
 #include "db/memtable.h"
 #include "memory/allocator.h"
 #include "memory/arena.h"
+#include "rocksdb/comparator.h"
 #include "rocksdb/slice.h"
 #include "rocksdb/slice_transform.h"
 #include "rocksdb/utilities/object_registry.h"
 
 namespace ROCKSDB_NAMESPACE {
+
+// Whether descend() may answer a tower hop from an eight-byte integer instead of
+// a virtual comparator call. The promise is that bytewise order on the order
+// bytes agrees with the comparator whenever those bytes differ, and only the
+// default bytewise user comparator makes it.
+//
+// Establishing that turns out to be the hardest part of the optimisation, and
+// the difficulty is in RocksDB's interface rather than in the idea.
+// MemTableRep::KeyComparator exposes ordering and nothing else: no accessor
+// reaches the InternalKeyComparator behind it, let alone the user comparator's
+// name. The only route is the concrete type RocksDB actually passes, and
+// recovering that needs RTTI.
+//
+// RocksDB compiles Release with -fno-rtti unless asked otherwise, so the answer
+// has to be "no" there rather than a guess. The alternative -- probing the
+// comparator with a handful of synthetic keys and generalising -- was rejected:
+// a comparator that agrees on every probe and disagrees on the tenth key of a
+// real workload would pass, and the failure would not be a slow descent but a
+// lost key. docs/phase3.md already records that the surrogate proposes and the
+// comparator disposes; a hint that guesses would be the same mistake one level
+// up.
+//
+// So the fast path is available exactly when RocksDB is built with
+// -DUSE_RTTI=ON, which is a supported cmake option and not a source patch, and
+// the plugin is correct either way. Anything that is not a MemTable::KeyComparator
+// over the default bytewise user comparator -- a reverse comparator, a comparator
+// carrying a timestamp, or a caller that subclasses MemTableRep::KeyComparator
+// itself -- fails one of the checks below and takes the slow descent.
+bool AparajitaHintOrdering(const MemTableRep::KeyComparator& cmp) {
+#ifdef ROCKSDB_USE_RTTI
+  const auto* known = dynamic_cast<const MemTable::KeyComparator*>(&cmp);
+  if (known == nullptr) {
+    return false;
+  }
+  const Comparator* user = known->comparator.user_comparator();
+  return user != nullptr &&
+         std::strcmp(user->Name(), BytewiseComparator()->Name()) == 0;
+#else
+  (void)cmp;
+  return false;
+#endif
+}
+
 namespace {
 
 // The tag appended to every user key inside an internal key: a 56-bit sequence
@@ -84,6 +128,8 @@ struct AparajitaTraits {
   int compare(const char* a, const char* b) const { return (*cmp)(a, b); }
 
   static Entry null_entry() { return nullptr; }
+
+  bool hint_ordering() const { return AparajitaHintOrdering(*cmp); }
 };
 
 using Table = aparajita::BasicMemTable<AparajitaTraits>;

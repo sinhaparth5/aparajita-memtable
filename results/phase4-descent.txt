@@ -1,0 +1,80 @@
+Phase 4a: the descent hint, controlled comparison
+date:     2026-08-30T09:47:32+01:00
+cpu:      11th Gen Intel(R) Core(TM) i5-11300H @ 3.10GHz
+cores:    8 logical
+gcc:      g++ (Ubuntu 15.2.0-16ubuntu1) 15.2.0
+rocksdb:  v9.11.2 (plugin build, Release, portable)
+
+NOT paper-grade, for the reason CLAUDE.md gives: this is the development laptop
+under WSL2, a fine correctness host and a poor measurement one. What makes these
+numbers worth quoting anyway is that they are a controlled comparison rather than
+a before-and-after across two different states of the tree.
+
+The control is RTTI. The descent's hint fast path is enabled only when the plugin
+can confirm the user comparator is the default bytewise one, and the only route to
+that is a dynamic_cast -- see AparajitaHintOrdering() and docs/phase4-descent.md.
+So two Release trees were built from identical sources, differing in -DUSE_RTTI
+alone: with it off the fast path compiles out and every tower hop takes the old
+path. One variable, and it is the one under test.
+
+The skiplist rows are the check on that. If -DUSE_RTTI moved throughput by itself
+the comparison would prove nothing; it does not, and the skiplist numbers below
+are the same in both trees to within run-to-run spread.
+
+== db_bench, 3 repetitions, 4 threads, 500k keys, WAL off, 1 GiB write buffer ==
+The buffer is 1 GiB so nothing flushes and the whole workload stays resident in
+the memtable. At the 256 MiB Phase 3 used, two SSTs are written and roughly half
+the reads never reach the memtable at all, which dilutes exactly what is being
+measured.
+
+                          fillrandom us/op        readrandom us/op
+-- hints off (-DUSE_RTTI=OFF)
+   skip_list                6.551 6.533 6.527      2.869 2.912 2.869
+   aparajita               11.343 11.504 11.492    4.835 4.845 4.841
+-- hints on (-DUSE_RTTI=ON)
+   skip_list                6.531 6.383 6.351      2.945 2.942 2.916
+   aparajita                8.059 8.044 8.044      2.779 2.824 2.780
+
+medians:
+                     hints off   hints on   change     vs skiplist (hints on)
+   fillrandom          11.492      8.044    -30.0%      +26.1% slower
+   readrandom           4.841       2.780   -42.6%       -5.5% faster
+
+== memtablerep_bench (RocksDB's own rep harness), 200k ops, 4 threads ==
+This one isolates the memtable: no SSTs, no block cache, no version machinery.
+
+                     write us/op   read us/op   read hit%
+-- hints off
+   skip_list            0.872         1.516       82.0
+   aparajita            1.640         1.716       86.3
+-- hints on
+   skip_list            0.923         1.609       82.9
+   aparajita            1.351         1.167       82.3
+
+                     hints off   hints on   change     vs skiplist (hints on)
+   write                 1.640       1.351   -17.6%      +46.4% slower
+   read                  1.716       1.167   -32.0%      -27.5% faster
+
+== standalone probe path, no RocksDB ==
+100k lookups into a 500k-key structure, 7 repetitions, one config per process so
+the two tables never share a heap. Medians of three runs of that:
+
+   hints off   3.62 - 4.00 us/probe
+   hints on    2.77 - 3.17 us/probe      roughly 20-25% faster
+
+The standalone figure improves by less than the RocksDB one because
+StringViewTraits compares with memcmp rather than through a virtual call, so the
+hint is displacing less work per hop.
+
+== structure shape, measured not estimated ==
+500,000 keys:  44,378 nodes, average fill 11.3 of 16
+per lookup:    30.0 successors examined, 22.3 advances, 4.0 of them on level 0
+tower linkage: 4,374 nodes linked at level 1 of 4,375 with height >= 2
+
+docs/phase3.md estimated eight hops at half fill. Both were wrong; the correction
+is recorded there and the reasoning is in docs/phase4-descent.md.
+
+== reproduce ==
+./scripts/build_rocksdb_plugin.sh          # release tree, USE_RTTI=ON, plus the debug test tree
+For the control tree, configure a second build directory identically with
+-DUSE_RTTI=OFF and run the same db_bench and memtablerep_bench invocations.

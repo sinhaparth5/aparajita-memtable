@@ -57,6 +57,24 @@ int main() {
     // padding is for.
     check(surrogate("ab") < surrogate("abc"), "prefix sorts below its extension");
 
+    // -----------------------------------------------------------------------
+    // descent hints
+    // -----------------------------------------------------------------------
+    check(descent_hint("") == 0u, "empty key hints to 0");
+    check(descent_hint("a") == 0x6100000000000000ull, "one byte sits in the top byte");
+    check(descent_hint("abcdefgh") == 0x6162636465666768ull, "eight bytes fill the word");
+    check(descent_hint("abcdefgh") == descent_hint("abcdefghZZZ"),
+          "the hint is an eight-byte prefix and ignores the rest");
+    check(descent_hint("ab") < descent_hint("abc"), "hint keeps prefix order");
+
+    // The tie the descent must never resolve on its own. These two keys have the
+    // same hint and are not equal, and compare_keys puts the shorter one first;
+    // a hop that trusted the hint here would order them arbitrarily.
+    check(descent_hint(std::string("abc")) == descent_hint(std::string("abc\0", 4)),
+          "zero padding is indistinguishable from a trailing zero byte");
+    check(compare_keys(std::string_view("abc"), std::string_view("abc\0", 4)) < 0,
+          "and the comparator, unlike the hint, still separates them");
+
     // The alias that forced an explicit occupancy count.
     {
         const char ff[] = {'\xFF', '\xFF', '\xFF', '\xFF'};
@@ -296,6 +314,116 @@ int main() {
                 }
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Keys the descent hint cannot decide
+    // -----------------------------------------------------------------------
+    //
+    // descend() answers a tower hop from an eight-byte hint and only falls back
+    // to the comparator when two hints tie. Every test above draws random keys,
+    // where a tie is rare, so they would all still pass if the fallback were
+    // deleted and ties were resolved by the hint alone.
+    //
+    // These keys make the tie universal. A shared table-or-tenant prefix longer
+    // than eight bytes is the shape bench/collision_report.cpp found in six of
+    // seven realistic distributions, and it gives every node in the structure an
+    // identical hint. Nothing here can be answered by the fast path, so this is
+    // the workload that decides whether the slow path is still correct.
+    {
+        Arena arena;
+        MemTable t(arena);
+
+        const std::string prefix = "tenant:00042:";  // thirteen shared bytes
+        std::mt19937_64 rng(20260830);
+        std::set<std::string> ref;
+        while (ref.size() < 3000) {
+            std::string k = prefix + random_key(rng, 8);
+            ref.insert(k);
+        }
+        std::vector<std::string> sorted(ref.begin(), ref.end());
+        std::sort(sorted.begin(), sorted.end(),
+                  [](const std::string& a, const std::string& b) {
+                      return compare_keys(a, b) < 0;
+                  });
+
+        std::vector<std::string> shuffled = sorted;
+        std::shuffle(shuffled.begin(), shuffled.end(), rng);
+        for (const std::string& k : shuffled) {
+            t.insert(k);
+        }
+
+        check(t.size() == sorted.size(), "shared-prefix keys all stored");
+        for (const std::string& k : sorted) {
+            check(t.contains(k), "shared-prefix key found again");
+        }
+        check(!t.contains(prefix), "the bare shared prefix was never inserted");
+
+        std::size_t i = 0;
+        bool ordered = true;
+        for (auto it = t.begin(); it.valid(); it.next(), ++i) {
+            if (i >= sorted.size() || it.key() != sorted[i]) {
+                ordered = false;
+                break;
+            }
+        }
+        check(ordered && i == sorted.size(),
+              "shared-prefix keys iterate in comparator order");
+
+        // Seeks over the same keys, which reach the descent through a different
+        // entry point than contains() does.
+        for (std::size_t probe = 0; probe < 500; ++probe) {
+            const std::string target = (probe & 1u)
+                                           ? sorted[rng() % sorted.size()]
+                                           : prefix + random_key(rng, 8);
+            auto lb = std::lower_bound(sorted.begin(), sorted.end(), target,
+                                       [](const std::string& a, const std::string& b) {
+                                           return compare_keys(a, b) < 0;
+                                       });
+            auto it = t.begin();
+            it.seek(target);
+            if (lb == sorted.end()) {
+                check(!it.valid(), "shared-prefix seek past the end is invalid");
+            } else {
+                check(it.valid() && it.key() == *lb, "shared-prefix seek lands on lower_bound");
+            }
+        }
+    }
+
+    // The other tie the hint cannot see: keys that agree on their first eight
+    // bytes and diverge only afterwards, including the zero-padding case where
+    // one key is a prefix of the other.
+    {
+        Arena arena;
+        MemTable t(arena);
+        const std::vector<std::string> keys = {
+            std::string("abcdefgh"),
+            std::string("abcdefgh ", 9),
+            std::string("abcdefgh  ", 10),
+            std::string("abcdefghi"),
+            std::string("abcdefghÿ", 9),
+        };
+        std::vector<std::string> sorted = keys;
+        std::sort(sorted.begin(), sorted.end(),
+                  [](const std::string& a, const std::string& b) {
+                      return compare_keys(a, b) < 0;
+                  });
+        for (const std::string& k : keys) {
+            t.insert(k);
+        }
+        check(t.size() == keys.size(), "keys tying in eight bytes are all distinct");
+        for (const std::string& k : keys) {
+            check(t.contains(k), "eight-byte tie found again");
+        }
+        std::size_t i = 0;
+        bool ordered = true;
+        for (auto it = t.begin(); it.valid(); it.next(), ++i) {
+            if (i >= sorted.size() || it.key() != sorted[i]) {
+                ordered = false;
+                break;
+            }
+        }
+        check(ordered && i == sorted.size(), "eight-byte ties iterate in comparator order");
     }
 
     if (g_failures == 0) {
