@@ -72,26 +72,44 @@ every node holds at `kEmptyKey`, so a permuted node is sentinel-padded above its
 count passed to the kernel and no tail blend. `lower_bound` keeps returning "above everything here"
 by the same popcount that answers everything else.
 
-### The lanes are no longer sorted in memory, so the kernel permutes them
+### The lanes are no longer sorted in memory, and it turned out not to matter
 
-Slot order is insertion order. The sixteen surrogates a search compares are therefore unsorted,
-and the Phase 2 result that made ordering affordable — over a sorted node the compare mask is a
-prefix of set bits, so its popcount *is* `lower_bound` — needs them sorted.
+**This section argued for a permutation that has since been removed. It is kept, corrected, because
+the mistake is more instructive than the conclusion.**
 
-On AVX-512 that is one instruction. `vpermd` takes exactly the sixteen 32-bit indices the order word
-packs, so the sorted line is materialised in a register and the popcount behind it is unchanged.
-AVX2 has no 16-lane crossing permute, so each output half is gathered from both source halves and
-blended on the index's high bit: four permutes and two blends where AVX-512 uses one instruction.
-That is the widest the two ISAs have diverged anywhere in this project, and it is an argument for
-AVX-512 that Phase 1 did not have — Phase 1 measured it 20% faster, which was never enough to
-require it.
+Slot order is insertion order. The sixteen surrogates a search compares are therefore unsorted, and
+the Phase 2 result that made ordering affordable — over a sorted node the compare mask is a prefix
+of set bits, so its popcount *is* `lower_bound` — appears to need them sorted. Phase 4b took that at
+face value and had the kernel permute the lanes into rank order first: one `vpermd` on AVX-512, and
+on AVX2, which has no 16-lane crossing permute, four permutes and two blends emulating it.
+
+The inference was wrong, and the counters are what exposed it. `results/phase4-ordered-kernels.txt`
+measured permuting at 2.0x on AVX-512 and 4.1x on AVX2 — enough of a bill to ask what it was buying.
+The answer is nothing; removing it took AVX2 from 21.03 to 9.89 cycles per probe and AVX-512 from
+8.12 to 6.04. `lower_bound` returns the *number* of live keys below the target, and a count
+over a set does not depend on how the set is arranged: permuting produces a different vector and an
+identical popcount. What needs sortedness is the prefix-of-set-bits *shape*, and the kernel never
+reads the shape. It reads the popcount, and popcount is blind to order.
+
+So the ordered kernel is the sorted-node kernel plus a live-lane mask, the order word feeds it only
+`count`, and the widest ISA divergence in this project evaporated along with the emulated permute.
 
 The load is masked to the live slots, and that is about concurrency rather than about the answer. A
 writer appending to this node is storing into slot `count` while the kernel runs, and an unmasked
-64-byte load would read the bytes it is writing. The permutation could not select that lane, so the
-result would be right, but reading it is still a data race. Masking to slots below `count` keeps the
-reader off it; the merge source is `kEmptyKey`, which is what those slots already hold, so the mask
-cannot change an answer.
+64-byte load would read the bytes it is writing. Masking to slots below `count` keeps the reader off
+it; the merge source is `kEmptyKey`, which is what those slots already hold and which sorts above
+every real key, so the mask cannot change an answer. This is the one part of the original argument
+that survives intact, and it is the reason the order word is still an argument to the kernel at all.
+
+It is also the whole of what the ordered kernel still costs above the sorted-node one: 1.50x on
+AVX-512 and 1.94x on AVX2, the AVX2 figure larger because `maskload` leaves zeros where the sentinel
+is wanted, and zeros sort below every real key rather than above. That is the standing price of
+reading a node a writer may be appending to, and there is no version of this design that does not
+pay it.
+
+`lower_bound_perm_scalar` still walks ranks through `order_slot`. That is deliberate: it is a
+reference that genuinely depends on the order word, so the randomized trials in `test_search.cpp`
+check the equivalence above on every run instead of trusting this paragraph.
 
 ### The prefix is frozen, and does not need to be revised
 

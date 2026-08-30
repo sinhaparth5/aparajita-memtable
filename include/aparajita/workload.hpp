@@ -87,4 +87,99 @@ inline std::vector<std::uint32_t> make_probes(const std::vector<Node>& nodes,
     return probes;
 }
 
+// ---------------------------------------------------------------------------
+// The append-only node shape
+// ---------------------------------------------------------------------------
+//
+// make_node above produces a node whose slots are sorted, which is what the
+// equality kernels and lower_bound_* want. It is not what BasicMemTable holds.
+// Since Phase 4b a slot is written once in insertion order and the sorted order
+// over the slots lives in a separate 64-bit word, so the kernel the structure
+// actually dispatches to -- lower_bound_perm_* -- has to permute the lanes into
+// rank order before it can compare them.
+//
+// Measuring the permuted kernels against a sorted node would therefore measure
+// the wrong thing twice over: the permutation would be the identity, so the
+// vpermd would be free, and the lanes would already be in the order the compare
+// wants. This builds the real shape instead -- a random slot assignment, which
+// is what keys arriving in random order produce.
+struct AppendNode {
+    Node node;
+    std::uint64_t order;
+};
+
+inline AppendNode make_append_node(std::mt19937_64& rng) {
+    // kNodeCapacity live keys, not kNodeKeys. Slot kPadSlot must stay at the
+    // sentinel: an unused rank decodes to it, which is the free padding the
+    // permuted kernels rely on instead of a separate count.
+    const Node sorted = make_node(rng);
+
+    std::vector<int> slot_of_rank(kNodeCapacity);
+    for (std::size_t i = 0; i < kNodeCapacity; ++i) {
+        slot_of_rank[i] = static_cast<int>(i);
+    }
+    std::shuffle(slot_of_rank.begin(), slot_of_rank.end(), rng);
+
+    AppendNode a{};
+    for (auto& k : a.node.keys) {
+        k = kEmptyKey;
+    }
+    a.order = 0;
+    for (std::size_t rank = 0; rank < kNodeCapacity; ++rank) {
+        const int slot = slot_of_rank[rank];
+        a.node.keys[slot] = sorted.keys[rank];
+        a.order |= static_cast<std::uint64_t>(slot + 1) << (4 * rank);
+    }
+    return a;
+}
+
+inline std::vector<AppendNode> make_append_nodes(std::size_t count, std::mt19937_64& rng) {
+    std::vector<AppendNode> nodes(count);
+    for (auto& n : nodes) {
+        n = make_append_node(rng);
+    }
+    return nodes;
+}
+
+// make_probes for the append-only shape. Same two properties -- randomized
+// hit/miss mix, hits on a uniformly random rank -- but it draws hits from the
+// live ranks only. Drawing from all sixteen slots would return kEmptyKey for one
+// slot in sixteen and quietly report the sentinel as a hit.
+inline std::vector<std::uint32_t> make_perm_probes(const std::vector<AppendNode>& nodes,
+                                                   std::size_t count,
+                                                   double hit_ratio,
+                                                   std::mt19937_64& rng) {
+    std::uniform_real_distribution<double> coin(0.0, 1.0);
+    std::uniform_int_distribution<std::size_t> node_pick(0, nodes.size() - 1);
+    std::uniform_int_distribution<std::size_t> rank_pick(0, kNodeCapacity - 1);
+    std::uniform_int_distribution<std::uint32_t> any_key(0, kEmptyKey - 1);
+
+    const auto present_anywhere = [&nodes](std::uint32_t k) {
+        for (const auto& a : nodes) {
+            for (std::size_t rank = 0; rank < kNodeCapacity; ++rank) {
+                if (a.node.keys[order_slot(a.order, static_cast<int>(rank))] == k) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    };
+
+    std::vector<std::uint32_t> probes;
+    probes.reserve(count);
+    for (std::size_t i = 0; i < count; ++i) {
+        if (coin(rng) < hit_ratio) {
+            const auto& a = nodes[node_pick(rng)];
+            probes.push_back(a.node.keys[order_slot(a.order, static_cast<int>(rank_pick(rng)))]);
+        } else {
+            std::uint32_t k;
+            do {
+                k = any_key(rng);
+            } while (present_anywhere(k));
+            probes.push_back(k);
+        }
+    }
+    return probes;
+}
+
 } // namespace aparajita::workload

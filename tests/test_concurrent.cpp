@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <random>
 #include <set>
@@ -59,6 +60,21 @@ constexpr int kReaderCap = 32;
 constexpr const char* kMode = "uninstrumented";
 #endif
 
+// The start barrier. A bare `while (!start.load()) {}` is what this replaces, and
+// it was not free: sixty-six threads are created in a loop, so the ones already
+// up spin at full tilt on every core while main is still creating the rest, and
+// under TSan each of those loads is an instrumented event. The threads that have
+// no work yet were competing with the thread whose only job was to release them.
+// Yielding costs nothing at low thread counts and stops the barrier being a
+// contention benchmark of its own at high ones.
+void await(const std::atomic<bool>& start) {
+    for (int spins = 0; !start.load(std::memory_order_acquire); ++spins) {
+        if (spins >= 64) {
+            std::this_thread::yield();
+        }
+    }
+}
+
 std::string make_key(int thread_id, int i) {
     // Interleaved rather than blocked. If each thread owned a contiguous key
     // range, writers would almost always land on different nodes and the
@@ -77,8 +93,15 @@ int keys_for(int threads) {
     return scaled < 10 ? 10 : scaled;
 }
 
+using Clock = std::chrono::steady_clock;
+
+double ms_since(Clock::time_point t) {
+    return std::chrono::duration<double, std::milli>(Clock::now() - t).count();
+}
+
 void run_at(int threads) {
     const int kKeysPerThread = keys_for(threads);
+    const Clock::time_point t_begin = Clock::now();
     Arena arena;
     MemTable table(arena);
 
@@ -96,8 +119,7 @@ void run_at(int threads) {
     // Writers.
     for (int t = 0; t < threads; ++t) {
         pool.emplace_back([&, t] {
-            while (!start.load(std::memory_order_acquire)) {
-            }
+            await(start);
             for (int i = 0; i < kKeysPerThread; ++i) {
                 table.insert(make_key(t, i));
             }
@@ -114,8 +136,7 @@ void run_at(int threads) {
     const int readers = std::min(threads < 4 ? 1 : threads / 2, kReaderCap);
     for (int r = 0; r < readers; ++r) {
         pool.emplace_back([&, r] {
-            while (!start.load(std::memory_order_acquire)) {
-            }
+            await(start);
             int hits = 0;
             std::mt19937_64 rng(static_cast<std::uint64_t>(r) + 1);
             for (int i = 0; i < kKeysPerThread; ++i) {
@@ -136,10 +157,21 @@ void run_at(int threads) {
         });
     }
 
+    // Phase timing, printed on every run. The 64-thread case under TSan was
+    // recorded as "does not complete" for two phases without anyone knowing which
+    // part of it was slow, and a total runtime cannot distinguish a structure that
+    // contends from a harness that does. Three numbers separate them: spawn is the
+    // harness, race is the structure, verify is single-threaded and should track
+    // key count and nothing else.
+    const double spawn_ms = ms_since(t_begin);
+    const Clock::time_point t_race = Clock::now();
+
     start.store(true, std::memory_order_release);
     for (auto& th : pool) {
         th.join();
     }
+    const double race_ms = ms_since(t_race);
+    const Clock::time_point t_verify = Clock::now();
 
     // Every key inserted must be present exactly once, and the table must still
     // be sorted. A lost update or a torn split shows up in one of these three.
@@ -180,8 +212,10 @@ void run_at(int threads) {
         check(false, std::to_string(threads) + " threads: " + broken);
     }
 
-    std::printf("  %2d threads x %4d keys: %zu stored, %d reader hits, arena %zu KiB\n", threads,
-                kKeysPerThread, seen.size(), reader_hits.load(), arena.memory_usage() / 1024);
+    std::printf("  %2d threads x %4d keys: %zu stored, %d reader hits, arena %zu KiB"
+                "  [spawn %.1f ms, race %.1f ms, verify %.1f ms]\n",
+                threads, kKeysPerThread, seen.size(), reader_hits.load(),
+                arena.memory_usage() / 1024, spawn_ms, race_ms, ms_since(t_verify));
     // Flushed per case. Under ThreadSanitizer the last case takes long enough
     // that buffered output looks indistinguishable from a hang, which cost real
     // time to diagnose once already.

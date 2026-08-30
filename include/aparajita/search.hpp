@@ -275,51 +275,56 @@ inline int lower_bound_perm_scalar(const Node& n, std::uint32_t key,
 
 #if APARAJITA_X86
 
-// Spreading sixteen nibbles into sixteen dwords is the only part that is not
-// obvious. Broadcasting the order word gives dwords that alternate low half and
-// high half; one permute reshapes that into "low half for ranks 0-7, high half
-// for ranks 8-15", after which a per-lane variable shift and a mask leave each
-// lane holding its own nibble. Subtracting one turns `slot + 1` into the slot and
-// carries an unused rank's zero to 15, the padding lane.
+// These two kernels do not permute anything, which their names no longer earn and
+// which took a measurement to notice. The reasoning is short and worth reading
+// before "restoring" the vpermd.
+//
+// lower_bound returns the rank r such that every rank below it holds a key < the
+// target. Ranks are sorted order, so r is the *number* of live keys below the
+// target -- and a count over a set does not depend on how the set is arranged.
+// Permuting the lanes into rank order produces a different vector and the same
+// popcount. Phase 4b assumed the ordered kernel needed sorted lanes because
+// lower_bound over a sorted array does; what that kernel actually uses is only
+// the popcount of the compare mask, never its shape, and popcount is blind to
+// order. The prefix-of-set-bits property is what needs sortedness, and nothing
+// here reads it.
+//
+// So the kernel is the sorted-node kernel plus a live-lane mask, and the mask is
+// the only thing the order word is still needed for: live slots are exactly
+// 0..count-1, because append() consumes slot n. That mask is about concurrency
+// rather than the answer -- a writer is storing into slot `count` while this
+// runs, and an unmasked 64-byte load would race with it. Unused lanes are filled
+// with kEmptyKey, which sorts above every real key and so is never counted.
+//
+// lower_bound_perm_scalar above is deliberately left permuting. It walks ranks
+// through order_slot, so it is a reference that genuinely depends on the order
+// word, and the randomized trials in tests/test_search.cpp check these two
+// against it on every run. That is what keeps the equivalence argued above a
+// tested property rather than a comment.
 __attribute__((target("avx512f")))
 inline int lower_bound_perm_avx512(const Node& n, std::uint32_t key,
                                    std::uint64_t order) noexcept {
-    const __m512i ones = _mm512_set1_epi32(1);
-    const __m512i nibble = _mm512_set1_epi32(0xF);
-
-    const __m512i halves = _mm512_set1_epi64(static_cast<long long>(order));
-    const __m512i pick = _mm512_set_epi32(1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0);
-    const __m512i shifts = _mm512_set_epi32(28, 24, 20, 16, 12, 8, 4, 0,
-                                            28, 24, 20, 16, 12, 8, 4, 0);
-    const __m512i lanes = _mm512_permutexvar_epi32(pick, halves);
-    const __m512i nib = _mm512_and_si512(_mm512_srlv_epi32(lanes, shifts), nibble);
-    const __m512i idx = _mm512_and_si512(_mm512_sub_epi32(nib, ones), nibble);
-
     const __mmask16 live = static_cast<__mmask16>((1u << order_count(order)) - 1u);
     const __m512i line = _mm512_mask_load_epi32(_mm512_set1_epi32(static_cast<int>(kEmptyKey)),
                                                 live, reinterpret_cast<const void*>(n.keys));
-    const __m512i sorted = _mm512_permutexvar_epi32(idx, line);
-
     const __mmask16 lt =
-        _mm512_cmplt_epu32_mask(sorted, _mm512_set1_epi32(static_cast<int>(key)));
+        _mm512_cmplt_epu32_mask(line, _mm512_set1_epi32(static_cast<int>(key)));
     return __builtin_popcount(static_cast<unsigned>(lt));
 }
 
-// _mm256_permutevar8x32_epi32 reads only the low three bits of each index, so
-// feeding it a 0-15 index twice -- once against each source half -- yields the
-// two candidate lanes, and the index's bit 3 says which to keep. That is the
-// whole of the 16-lane crossing permute AVX2 does not have.
+// AVX2 gains the most from the argument above: it has no 16-lane crossing permute,
+// so it was paying four permutes and two blends to emulate one vpermd, and the
+// counters put that at 21.03 cycles per probe against 5.10 for the same compare
+// over a sorted node. None of it was doing anything.
 //
 // The unsigned-versus-signed trap in lower_bound_avx2 applies here unchanged:
 // _mm256_cmpgt_epi32 is signed, so both sides are biased by 0x80000000 or
-// kEmptyKey would read as -1 and sort below every real key.
+// kEmptyKey would read as -1 and sort below every real key. And the dead lanes
+// are blended rather than left as maskload's zeros, which would sort *below*
+// every real key and be counted.
 __attribute__((target("avx2")))
 inline int lower_bound_perm_avx2(const Node& n, std::uint32_t key,
                                  std::uint64_t order) noexcept {
-    const __m256i ones = _mm256_set1_epi32(1);
-    const __m256i nibble = _mm256_set1_epi32(0xF);
-    const __m256i seven = _mm256_set1_epi32(7);
-    const __m256i shifts = _mm256_set_epi32(28, 24, 20, 16, 12, 8, 4, 0);
     const __m256i pad = _mm256_set1_epi32(static_cast<int>(kEmptyKey));
 
     const __m256i count = _mm256_set1_epi32(order_count(order));
@@ -332,29 +337,10 @@ inline int lower_bound_perm_avx2(const Node& n, std::uint32_t key,
     const __m256i src_hi =
         _mm256_blendv_epi8(pad, _mm256_maskload_epi32(base + 8, live_hi), live_hi);
 
-    const __m256i word_lo = _mm256_set1_epi32(static_cast<int>(static_cast<std::uint32_t>(order)));
-    const __m256i word_hi =
-        _mm256_set1_epi32(static_cast<int>(static_cast<std::uint32_t>(order >> 32)));
-    const __m256i idx_lo = _mm256_and_si256(
-        _mm256_sub_epi32(_mm256_and_si256(_mm256_srlv_epi32(word_lo, shifts), nibble), ones),
-        nibble);
-    const __m256i idx_hi = _mm256_and_si256(
-        _mm256_sub_epi32(_mm256_and_si256(_mm256_srlv_epi32(word_hi, shifts), nibble), ones),
-        nibble);
-
-    const __m256i sorted_lo =
-        _mm256_blendv_epi8(_mm256_permutevar8x32_epi32(src_lo, idx_lo),
-                           _mm256_permutevar8x32_epi32(src_hi, idx_lo),
-                           _mm256_cmpgt_epi32(idx_lo, seven));
-    const __m256i sorted_hi =
-        _mm256_blendv_epi8(_mm256_permutevar8x32_epi32(src_lo, idx_hi),
-                           _mm256_permutevar8x32_epi32(src_hi, idx_hi),
-                           _mm256_cmpgt_epi32(idx_hi, seven));
-
     const __m256i bias = _mm256_set1_epi32(INT32_MIN);
     const __m256i needle = _mm256_xor_si256(_mm256_set1_epi32(static_cast<int>(key)), bias);
-    const __m256i lt_lo = _mm256_cmpgt_epi32(needle, _mm256_xor_si256(sorted_lo, bias));
-    const __m256i lt_hi = _mm256_cmpgt_epi32(needle, _mm256_xor_si256(sorted_hi, bias));
+    const __m256i lt_lo = _mm256_cmpgt_epi32(needle, _mm256_xor_si256(src_lo, bias));
+    const __m256i lt_hi = _mm256_cmpgt_epi32(needle, _mm256_xor_si256(src_hi, bias));
 
     const unsigned m_lo = static_cast<unsigned>(_mm256_movemask_ps(_mm256_castsi256_ps(lt_lo)));
     const unsigned m_hi = static_cast<unsigned>(_mm256_movemask_ps(_mm256_castsi256_ps(lt_hi)));

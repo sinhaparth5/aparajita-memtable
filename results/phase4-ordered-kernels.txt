@@ -1,0 +1,242 @@
+Ordered kernels under the counters, and the 64-thread TSan case
+===============================================================
+
+Host: GCP c4-standard-16, Intel Xeon Platinum 8581C (Emerald Rapids), 8 cores /
+16 threads, Ubuntu 24.04, GCC 14.2.0, Release (-O3, no -march=native).
+kernel.perf_event_paranoid=1, vm.mmap_rnd_bits=28.
+Measured on a rented host, not the development laptop, per the rule in CLAUDE.md.
+
+Two things were closed here, both of them prerequisites for Phase 4 rather than
+Phase 4 itself.
+
+The lower_bound_perm_* rows in section 1 are the kernels as they stood when this
+was measured, and measuring them is what showed the permutation they perform was
+unnecessary: lower_bound returns a count of the live keys below the target, and a
+count does not depend on how they are arranged. The permutation was removed, and
+section 3 measures what replaced it. Section 1's permuted rows are kept as the
+evidence that led there; section 3 is the current tree.
+
+
+1. The counter harness now covers the kernel the structure runs
+==============================================================
+
+counter_report and bench_search measured the equality family only, which was the
+whole surface in Phase 1. Since Phase 4b every lookup goes to lower_bound_perm_*,
+so an equality cycle count was a number for a kernel nothing calls.
+
+Three families are now reported. The middle one is the reference: it is
+lower_bound over a node whose slots are sorted, which is what the structure would
+run if a node were still rebuilt per insert. The difference between it and the
+third is the price of the append-only layout, which until now was argued rather
+than measured.
+
+== 200,000 probes, 9 repetitions, median, hit ratio 0.50 ==
+
+  equality: search_* over a sorted node
+  kernel              cyc/probe   cyc sd  ins/probe    IPC   brnch/prb   miss/prb
+  scalar_linear           28.49     0.06      34.50   1.21       15.24     0.5296
+  scalar_autovec          28.44     0.10      34.50   1.21       15.24     0.5281
+  scalar_branchless       16.53     0.00      90.00   5.45        3.00     0.0000
+  scalar_binary           71.08     0.14      51.41   0.72       13.16     1.8939
+  avx2                     4.02     0.00      20.00   4.98        3.00     0.0000
+  avx512                   5.02     0.01      15.00   2.99        3.00     0.0000
+
+  ordered: lower_bound_* over a sorted node (the reference)
+  lb_scalar               40.32     0.35      26.69   0.66       11.33     1.0450
+  lb_scalar_brless         8.67     0.00      44.00   5.07        3.00     0.0000
+  lb_avx2                  5.10     0.00      25.00   4.90        3.00     0.0000
+  lb_avx512                4.04     0.01      16.00   3.97        3.00     0.0000
+
+  ordered: lower_bound_perm_* over an append-only node (what runs)
+  perm_scalar             49.54     0.08      87.35   1.76       21.66     0.9271
+  perm_avx2               21.03     0.00      70.00   3.33        4.00     0.0000
+  perm_avx512              8.12     0.01      42.00   5.17        4.00     0.0000
+
+At hit ratio 0.90 every ordered row is within 0.02 cycles of the above; the
+ordered kernels are branchless, so the hit/miss mix does not move them. Only the
+branchy equality baselines respond to it (scalar_linear 28.49 -> 40.47).
+
+What permuting costs, then:
+
+                 sorted    permuted    factor   instructions
+  AVX-512          4.04        8.12     2.01x     16 ->  42
+  AVX2             5.10       21.03     4.12x     25 ->  70
+  scalar          40.32       49.54     1.23x     27 ->  87
+
+Two readings of that table are worth stating plainly.
+
+The AVX2 permuted kernel is the shipped default and it is the worst case. AVX2
+has no 16-lane crossing permute, so each output half is gathered from both source
+halves and blended: four permutes and two blends against AVX-512's single vpermd.
+That is 45 extra instructions and 16 extra cycles per probe.
+
+And at 21.03 cycles the AVX2 permuted kernel loses to lb_scalar_brless at 8.67 --
+a scalar branchless lower_bound over a sorted node is 2.4x faster than the SIMD
+permuted kernel on an AVX2-only host. It still beats the branchy scalar baselines
+and it is still branchless (0.0000 misses per probe, which is the Phase 1 claim
+holding), but "SIMD beats scalar" is not true of this kernel on this ISA.
+
+None of this contradicts Phase 4b's db_bench result. That result was dominated by
+arena locality -- 445.4 -> 100.6 bytes per key, 2.1x more keys resident -- and the
+probe kernel is a small part of a lookup that also walks a tower. It does mean the
+append-only layout bought its write win at a measured read-side price that had
+never been quoted, and that the price is four times larger on the ISA that ships.
+
+== bench_search, probe/ family, wall clock ==
+Reported for completeness. The wall-clock harness inlines the kernel through a
+template parameter where counter_report calls through a function pointer, so the
+two disagree on the scalar rows and counter_report is the instrument to quote.
+The vector rows agree in direction.
+
+  probe/lb_avx2             11302 ns     probe/perm_avx2      48359 ns   4.3x
+  probe/lb_avx512            7776 ns     probe/perm_avx512    19647 ns   2.5x
+  probe/lb_scalar_brless    15159 ns     probe/perm_scalar    41628 ns   2.7x
+
+perm_avx2 is slower than perm_scalar here (48359 against 41628 ns), which is the
+same finding as the counter table in a harsher form.
+
+
+2. The 64-thread ThreadSanitizer case: it was the harness
+=========================================================
+
+Standing status: "clean at 1, 4 and 16; 64 does not complete under
+instrumentation". CLAUDE.md explained it as contention -- all 64 threads walking
+the key space at the same rate, piling onto one node's lock, every test_and_set an
+instrumented event -- and recorded 606 seconds without completing on an idle
+16-core host.
+
+That explanation does not survive arithmetic. The instrumented build already
+scales work down: keys_for() gives 64 threads ten keys each, so the whole case is
+640 inserts. No amount of lock contention makes 640 inserts take ten minutes.
+
+The cost was the start barrier. Every thread ran
+
+    while (!start.load(std::memory_order_acquire)) { }
+
+with no pause and no yield. Sixty-six threads are created in a loop, so each one
+that came up spun flat out on every available core while main was still creating
+the rest -- and under TSan each of those loads is an instrumented event. The
+threads with no work yet were starving the thread whose only job was to release
+them. It was a livelock in the harness, and the structure never got to run.
+
+The barrier now spins 64 times and then yields, matching the insert path's own
+backoff. Result:
+
+  concurrent insert (thread-sanitized)
+     1 threads x  640 keys: 640 stored  [spawn  1.1 ms, race  3.7 ms, verify 1.9 ms]
+     4 threads x  160 keys: 640 stored  [spawn  1.0 ms, race  2.5 ms, verify 2.0 ms]
+    16 threads x   40 keys: 640 stored  [spawn  3.1 ms, race 67.1 ms, verify 2.2 ms]
+    64 threads x   10 keys: 640 stored  [spawn 10.2 ms, race  6.9 ms, verify 2.3 ms]
+  all concurrency tests passed
+  tsan exit: 0
+
+Six point nine milliseconds, against 606 seconds without completing. No races
+reported at any thread count. The Phase 2 exit criterion is met.
+
+The per-phase timing is now printed on every run, instrumented or not, because a
+total runtime cannot distinguish a structure that contends from a harness that
+does -- which is exactly the mistake this closes. Uninstrumented, for reference:
+
+     1 threads x 4000 keys: 4000 stored    [spawn  0.5 ms, race   1.5 ms, verify   0.8 ms]
+     4 threads x 4000 keys: 16000 stored   [spawn  1.6 ms, race   5.7 ms, verify   4.5 ms]
+    16 threads x 4000 keys: 64000 stored   [spawn  6.6 ms, race  26.7 ms, verify  26.5 ms]
+    64 threads x 4000 keys: 256000 stored  [spawn 26.0 ms, race 106.4 ms, verify 163.3 ms]
+
+ctest -E tsan: 3/3 passed.
+
+This is the second standing explanation in this project to be wrong in the same
+way. Phase 4a found the descent examined thirty successors where docs/phase3.md
+had estimated eight; this found a harness livelock where CLAUDE.md had recorded
+structural contention. Both were plausible, both were written down as fact, and
+both were cheap to measure once someone did.
+
+
+3. After removing the permutation
+=================================
+
+Host: same family, GCP c4-standard-8, Xeon Platinum 8581C (Emerald Rapids),
+Ubuntu 24.04, GCC 14.2.0, Release. Same probe count, repetitions and hit ratios.
+The sorted-node families reproduce section 1 to within 0.2 cycles across the two
+instance sizes, which is what makes the permuted rows comparable across them.
+
+== 200,000 probes, 9 repetitions, median, hit ratio 0.50 ==
+
+  ordered: lower_bound_* over a sorted node (the reference, unchanged)
+  kernel              cyc/probe   cyc sd  ins/probe    IPC   brnch/prb   miss/prb
+  lb_scalar               40.14     0.32      26.69   0.66       11.33     1.0390
+  lb_scalar_brless         8.67     0.01      44.00   5.07        3.00     0.0000
+  lb_avx2                  5.10     0.00      25.00   4.91        3.00     0.0000
+  lb_avx512                4.03     0.01      16.00   3.97        3.00     0.0000
+
+  ordered: lower_bound_perm_* over an append-only node (no permutation)
+  perm_scalar             49.49     0.12      87.35   1.77       21.66     0.9276
+  perm_avx2                9.89     0.00      41.00   4.15        4.00     0.0000
+  perm_avx512              6.04     0.01      30.00   4.97        4.00     0.0000
+
+Hit ratio 0.90 reproduces every ordered row to within 0.01 cycles. The kernels
+are branchless, so the mix does not reach them.
+
+What the removal bought:
+
+                   before    after   change   instructions
+  perm_avx2         21.03     9.89   -53.0%     70 -> 41
+  perm_avx512        8.12     6.04   -25.6%     42 -> 30
+  perm_scalar       49.54    49.49     none     unchanged, still permutes by design
+
+perm_scalar is unchanged on purpose. It still walks ranks through order_slot, so
+it is a reference that genuinely depends on the order word and the randomized
+trials in tests/test_search.cpp check the equivalence on every run.
+
+And what is left, which is the part worth being precise about:
+
+                 sorted    append-only   residual
+  AVX-512          4.03           6.04      1.50x
+  AVX2             5.10           9.89      1.94x
+
+The residual is not permutation any more -- there is none. It is the live-lane
+mask: order_count on the order word, the mask built from it, and a masked load in
+place of a plain one, which on AVX2 is two compares, two maskloads and two blends
+because the sentinel has to be blended in where maskload would leave zeros. Zeros
+sort below every real key and would be counted; kEmptyKey sorts above and is not.
+
+That mask cannot be removed. A writer is storing into slot `count` while the
+kernel runs, and an unmasked 64-byte load races with it. It is the same mask the
+Phase 4b design document justified on memory-model grounds alone, and TSan still
+cannot see the race it prevents, because GCC does not instrument the vector load.
+So 1.50x and 1.94x are the standing price of reading a node that a writer may be
+appending to, and the honest floor for this design rather than a defect.
+
+One comparison that changed sign, and one that did not. Before the removal the
+AVX2 ordered kernel was 2.4x slower than lb_scalar_brless (21.03 against 8.67),
+which meant SIMD lost to scalar on the shipped ISA. It is now 9.89 against 8.67,
+a 14% gap, and lb_scalar_brless is not an available alternative anyway: it reads
+a sorted node and no scalar branchless kernel exists for the append-only shape.
+The claim "SIMD beats scalar here" is no longer false, but it is close enough to
+even on AVX2 to be worth rechecking if the masking ever changes.
+
+The AVX-512-versus-AVX2 gap on the ordered kernel narrowed from 2.6x to 1.64x
+(6.04 against 9.89). That weakens the case ROADMAP.md briefly made for requiring
+AVX-512: the gap is now the same order as the 20% on the equality kernel plus the
+extra masking AVX2 needs, not a different regime.
+
+== bench_search, probe/ family, wall clock ==
+Directionally identical, on the harness whose scalar rows are not comparable with
+counter_report's because it inlines through a template parameter.
+
+  probe/perm_avx2      48359 -> 23248 ns   -51.9%
+  probe/perm_avx512    19647 -> 12219 ns   -37.8%
+
+== correctness, same tree, same host ==
+  ctest -E tsan                     3/3 passed
+  test_concurrent_tsan              clean at 1, 4, 16, 64; 4.4 ms race at 64
+  standalone equivalence check      1,600,000 comparisons, 0 mismatches
+
+
+Reproduce
+=========
+  cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j$(nproc)
+  ./build/counter_report                 # three tables
+  ./build/counter_report 200000 9 0.9    # hit-ratio check
+  ./build/bench_search --benchmark_filter=probe/
+  ./build/test_concurrent
+  ./build/test_concurrent_tsan           # now terminates; ~90 ms total

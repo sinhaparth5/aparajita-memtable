@@ -28,14 +28,20 @@ Four CTest targets, each also runnable directly for full output:
 Every test binary is framework-free. It prints one `FAIL:` line per disagreement and exits
 non-zero, so a partial failure is readable without parsing a report.
 
-**A plain `ctest` does not terminate on an 8-core host.** `concurrent_insert_tsan` runs the same
-thread counts as the uninstrumented target, and the 64-thread case does not complete under
-instrumentation on this laptop; it prints 1, 4 and 16 clean and then hangs. That is the documented
-Phase 2 gap, not a regression, and `docs/phase2.md` explains why (all 64 threads walk the key space
-at the same rate, so they contend on one node's lock, and every `test_and_set` in the backoff loop
-is a TSan event). Use `-E tsan` for routine work, run `./build/test_concurrent_tsan` on its own when
-touching concurrency, and expect to kill it after the 16-thread line. Configuring with
-`-DAPARAJITA_TSAN=OFF` drops the target entirely.
+A plain `ctest` now terminates, including the TSan target, which was not true before
+`results/phase4-ordered-kernels.txt`. The 64-thread instrumented case used to hang after printing
+the 16-thread line, and both this file and `docs/phase2.md` explained it as lock contention. It was
+the test's own start barrier: every thread spun on `while (!start.load()) {}` with no yield, so the
+threads already created starved the thread still creating the rest, and under TSan each of those
+loads is an instrumented event. The barrier now spins 64 times and yields, and the case finishes in
+6.9 ms of race time. Do not reintroduce a bare spin there.
+
+`-E tsan` is still worth using for routine work simply because the instrumented target is slower,
+and `-DAPARAJITA_TSAN=OFF` still drops it entirely.
+
+Every concurrent run now prints `[spawn, race, verify]` timings per thread count, instrumented or
+not. That is deliberate: a single total cannot tell a structure that contends from a harness that
+does, which is the mistake that cost this project two phases of a wrong explanation.
 
 `counter_report` takes optional positional arguments: probe count, repetitions, hit ratio
 (`./build/counter_report 200000 9 0.75`). Its `freq/nom` column is core cycles over reference
@@ -171,9 +177,13 @@ unused rank decodes to slot 15, the lane no key occupies and every node keeps at
 permuted node is sentinel-padded for free. Do not "recover" the sixteenth slot without reading the
 last section of the design document first.
 
-Slot order is insertion order, so the lanes are not sorted in memory and `lower_bound` permutes them
-into rank order before comparing: `lower_bound_perm_avx512` does it with one `vpermd`, the AVX2 kernel
-with four permutes and two blends. The load is masked to the live slots, and that mask is about
+Slot order is insertion order, so the lanes are not sorted in memory -- and the ordered kernel does
+not care. `lower_bound` returns the number of live keys below the target, and a count over a set does
+not depend on how the set is arranged, so the permutation into rank order that these kernels used to
+perform produced a different vector and the same popcount. It is gone. What needs sortedness is the
+prefix-of-set-bits property, and the kernel reads only the popcount, never the mask's shape. The
+order word now feeds the kernel one thing, `count`, and the load is masked to the live slots; that
+mask is about
 concurrency, not about the answer -- a writer is storing into slot `count` while the kernel runs, and
 an unmasked 64-byte load would race with it. No test can catch its removal and neither can TSan,
 which does not instrument the vector load; the mask is justified by the memory model alone.
@@ -255,8 +265,32 @@ noise still yields correct lookups, correct iteration, and a byte-for-byte match
 skiplist. Four deliberate kernel bugs passed the entire differential suite and fail only in
 `test_search`. Anything that touches these kernels must be checked there.
 
-The counter and timing harnesses still cover the equality family only, which is the remaining
-measurement gap before Phase 4 quotes an ordered number.
+`counter_report` and `bench_search` cover all three families as of
+`results/phase4-ordered-kernels.txt`; they measured equality only until then, which meant every
+published cycle count was for a kernel the structure had stopped calling at Phase 4b.
+
+Closing that gap immediately paid for itself. The measured cost of permuting was 4.04 -> 8.12 cycles
+per probe on AVX-512 and 5.10 -> 21.03 on AVX2, which put the AVX2 ordered kernel 2.4x *behind*
+`lower_bound_scalar_branchless`. Asking what that bought produced the answer that it bought nothing,
+and removing it gave 21.03 -> 9.89 on AVX2 and 8.12 -> 6.04 on AVX-512.
+
+The residual over the sorted-node kernels is 1.50x on AVX-512 (6.04 against 4.03) and 1.94x on AVX2
+(9.89 against 5.10), and it is worth knowing what that is, because it is not slack. It is the
+live-lane mask: `order_count`, the mask built from it, and a masked load in place of a plain one,
+which on AVX2 costs two compares, two maskloads and two blends -- the sentinel has to be blended in
+where `maskload` would leave zeros, and zeros sort below every real key and would be counted. The
+mask exists because a writer is storing into slot `count` while the kernel runs. It cannot be
+removed, so those two ratios are the standing price of reading a node under concurrent append rather
+than a defect to fix. Numbers in `results/phase4-ordered-kernels.txt` section 3.
+
+`workload::make_append_node` builds the shape the permuted kernels are measured on: slots in a
+random order with `kPadSlot` at `kEmptyKey`. It mattered more when the kernels permuted, but it is
+still the honest shape and still what the structure holds.
+
+`lower_bound_perm_scalar` is deliberately left walking ranks through `order_slot`, so it remains a
+reference that genuinely depends on the order word. That is what makes the randomized trials in
+`test_search.cpp` a standing check that dropping the permutation is valid, rather than a comment
+asserting it. Do not "simplify" it to match the vector kernels.
 
 All three carry a `runnable` flag derived from `detect_isa()`. The ISA guards are not optional
 bookkeeping: an unguarded AVX-512 kernel executes and faults on a host that lacks it.
@@ -362,13 +396,11 @@ What Phase 3 answered, and what it left open:
 - `arena.hpp` was a stand-in written against arena semantics deliberately, and swapping in
   `rocksdb::Allocator` behind `Traits::allocate` was the substitution it was meant to be. Its single
   mutex is gone on the RocksDB path; the standalone harnesses still use it.
-- ThreadSanitizer coverage at 64 threads is still the one open Phase 2 exit criterion, but the
-  standing guess about it is now measured and wrong. It is not core count: on an idle 16-core Xeon
-  the 64-thread case ran 606 seconds without completing, having taken seconds at 1, 4 and 16. The
-  work grows with contention, not with cores -- all 64 threads walk the key space at the same rate
-  and pile onto one node's lock, and every `test_and_set` in the backoff loop is a TSan event.
-  Closing it wants the test changed, by interleaving key ranges or shortening the spin budget under
-  instrumentation, rather than a bigger machine.
+- ThreadSanitizer coverage at 64 threads is **closed**, and neither standing explanation for it was
+  right. It was not core count, and it was not lock contention either: the instrumented build
+  already runs only 640 inserts at 64 threads, which no amount of contention stretches to ten
+  minutes. It was the test's own start barrier busy-spinning. Fixed, clean at 1, 4, 16 and 64, and
+  the whole instrumented run takes about 90 ms. See `results/phase4-ordered-kernels.txt`.
 
 The development laptop is an i5-11300H (Tiger Lake) with 8 logical cores. It has AVX-512, unlike the
 i5-8400H that produced the archived results, but it runs under WSL2 where the governor is not
