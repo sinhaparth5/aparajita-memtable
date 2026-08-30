@@ -1,0 +1,163 @@
+Phase 4: empirical evaluation
+
+date:      2026-08-30T17:11:24+00:00
+host:      aparajita-p4eval
+kernel:    Linux 6.17.0-1022-gcp
+cpu:       INTEL(R) XEON(R) PLATINUM 8581C CPU @ 2.30GHz
+vcpu:      24 logical
+cores:     12 per socket, 1 socket(s)
+smt:       1
+memory:    88 GiB
+isa:       avx512f
+governor:  unavailable
+turbo:     unavailable
+paranoid:  1
+gcc:       g++-14 (Ubuntu 14.2.0-4ubuntu2~24.04.1) 14.2.0
+rocksdb:   v9.11.2
+aparajita: 0db7c91
+total_ops: 2000000
+keyspace:  2000000
+wbuf:      4294967296
+
+== fillrandom, WAL off ==
+Total operations held constant; num is per thread.
+  threads      aparajita      skip_list         vector   aparajita vs skip_list
+                  kops/s         kops/s         kops/s
+        1          678.9          571.2         2222.9     +18.8%
+        4          677.9          660.9         1201.0      +2.6%
+       16         1394.8         1437.7          911.1      -3.0%
+       64          505.8          502.6         1101.0      +0.6%
+
+  threads      aparajita      skip_list         vector
+                   us/op          us/op          us/op
+        1          1.473          1.750          0.450
+        4          5.900          6.051          3.327
+       16         11.450         11.099         17.467
+       64        126.314        127.076         57.932
+
+  memtable-resident: no run produced more than the flush on close
+
+== fillrandom: scaling relative to 1 thread ==
+  threads      aparajita      skip_list         vector
+        1          1.00x          1.00x          1.00x
+        4          1.00x          1.16x          0.54x
+       16          2.05x          2.52x          0.41x
+       64          0.75x          0.88x          0.50x
+
+== readrandom over a resident memtable, WAL off ==
+VectorRep's read count is capped; see run_phase4.sh for why.
+  threads      aparajita      skip_list         vector   aparajita vs skip_list
+                  kops/s         kops/s         kops/s
+        1          731.9          528.2            0.0     +38.6%
+        4         2703.1         1969.1            0.0     +37.3%
+       16         8773.9         7181.8            0.0     +22.2%
+       64        10913.5         8677.9            0.0     +25.8%
+
+  threads      aparajita      skip_list         vector
+                   us/op          us/op          us/op
+        1          1.366          1.892     905656.250
+        4          1.469          2.016     915248.200
+       16          1.652          2.082    1101392.188
+       64          4.364          5.697    3270491.094
+
+  memtable-resident: no run produced more than the flush on close
+
+== readwhilewriting, WAL off ==
+--threads is the reader count; one writer runs alongside.
+  threads      aparajita      skip_list         vector   aparajita vs skip_list
+                  kops/s         kops/s         kops/s
+        1          705.6          519.7            0.0     +35.8%
+        4         2693.8         1950.2            0.0     +38.1%
+       16         8691.9         6738.8            0.0     +29.0%
+       64        10531.9         8578.5            0.0     +22.8%
+
+  threads      aparajita      skip_list         vector
+                   us/op          us/op          us/op
+        1          1.417          1.923    5422365.800
+        4          1.469          2.022    5135828.000
+       16          1.694          2.100    1131803.000
+       64          4.607          5.848    3287239.562
+
+  !! the write buffer filled mid-run here, so these rows were not
+     served by the memtable alone and should not be quoted:
+     vector t=1: 4 SST files (one is the flush on close)
+     vector t=4: 3 SST files (one is the flush on close)
+
+== readwhilewriting: scaling relative to 1 thread ==
+  threads      aparajita      skip_list         vector
+        1          1.00x          1.00x            n/a
+        4          3.82x          3.75x            n/a
+       16         12.32x         12.97x            n/a
+       64         14.93x         16.51x            n/a
+
+== fillrandom with the WAL on, 16 threads ==
+The same point as the first table, WAL enabled, to show what it hides.
+  threads      aparajita      skip_list         vector   aparajita vs skip_list
+                  kops/s         kops/s         kops/s
+       16         1043.0         1048.1            n/a      -0.5%
+
+  threads      aparajita      skip_list         vector
+                   us/op          us/op          us/op
+       16         15.220         15.130            n/a
+
+  memtable-resident: no run produced more than the flush on close
+
+== hardware counters, 16 threads ==
+Each row is the difference between two runs of the same benchmark that
+differ only in how many operations they perform. Both do an identical
+fill at an identical seed, so process setup, the fill, and the flush on
+close cancel exactly rather than approximately. The figure is therefore
+the marginal cost of one operation, not an average over the process.
+Absolute counts for both points are in raw/.
+
+  aparajita
+           benchmark  ops differenced   instr/op  branch miss/op  branch miss %  L1 miss/op    HITM/op   dirty %
+          fillrandom          1800000    22181.7           16.15          0.361      178.86        n/a       n/a
+          readrandom         18000000     3271.5            8.46          1.241       62.18        n/a       n/a
+    readwhilewriting         18000000     3622.2            9.53          1.265       72.41        n/a       n/a
+
+  skip_list
+           benchmark  ops differenced   instr/op  branch miss/op  branch miss %  L1 miss/op    HITM/op   dirty %
+          fillrandom          1800000    24177.1           18.01          0.379      227.73        n/a       n/a
+          readrandom         18000000     7349.9           10.39          0.727      103.99        n/a       n/a
+    readwhilewriting         18000000     7597.6           11.93          0.808      110.70        n/a       n/a
+
+  vector
+           benchmark  ops differenced   instr/op  branch miss/op  branch miss %  L1 miss/op    HITM/op   dirty %
+          fillrandom          1800000    14989.5           50.70          1.636      176.96        n/a       n/a
+          readrandom               16 6367892790.1     18912615.00          1.581 29697154.38        n/a       n/a
+    readwhilewriting               16 7953944813.2     21033093.38          1.380 33534193.56        n/a       n/a
+
+== memtablerep_bench: the rep alone, us/op ==
+No SSTs, no block cache, no version machinery. VectorRep runs fillrandom
+only: memtablerep_bench has no read cap, and its point lookup on a
+mutable vector sorts the whole bucket, so a read pass there would time
+std::sort rather than a rep.
+
+  fillrandom   (RocksDB runs this single-threaded whatever --num_threads says)
+  threads      aparajita       skiplist         vector
+        1         0.5435         0.8040         0.0993    +47.9% vs skiplist
+        4         0.5438         0.8140         0.0928    +49.7% vs skiplist
+       16         0.5284         0.8009         0.0858    +51.6% vs skiplist
+       64         0.5367         0.8100         0.0933    +50.9% vs skiplist
+
+  readrandom
+  threads      aparajita       skiplist         vector
+        1         0.5041         0.8193            n/a    +62.5% vs skiplist
+        4         0.8292         1.1798            n/a    +42.3% vs skiplist
+       16         3.9942         4.4098            n/a    +10.4% vs skiplist
+       64        52.2454        52.4739            n/a     +0.4% vs skiplist
+
+  readwrite read
+  threads      aparajita       skiplist         vector
+        1            n/a            n/a            n/a
+        4         0.5985         0.8675            n/a    +45.0% vs skiplist
+       16         3.8929         4.0410            n/a     +3.8% vs skiplist
+       64        56.5463        55.5167            n/a     -1.8% vs skiplist
+
+  readwrite write
+  threads      aparajita       skiplist         vector
+        1            n/a            n/a            n/a
+        4         0.1995         0.2892            n/a    +45.0% vs skiplist
+       16         0.2595         0.2694            n/a     +3.8% vs skiplist
+       64         0.8974         0.8810            n/a     -1.8% vs skiplist

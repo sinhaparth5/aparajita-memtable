@@ -1,0 +1,4 @@
+counter_threads: 16
+write_points:    hi=2000000 lo=200000 total ops
+read_points:     hi=20000000 lo=2000000 total ops
+read_points_vec: hi=20 lo=2 total ops

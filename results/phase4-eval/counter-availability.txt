@@ -1,0 +1,4 @@
+perf_event_paranoid: 1
+hitm event resolved:  mem_load_l3_hit_retired.xsnp_fwd
+clean xsnp resolved:  mem_load_l3_hit_retired.xsnp_no_fwd
+perf list entries:    6255

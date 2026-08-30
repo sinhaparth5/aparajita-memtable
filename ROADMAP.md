@@ -119,7 +119,7 @@ Results and analysis in [docs/phase2.md](docs/phase2.md), decisions in
 
 | Exit criterion | Target | Result |
 | --- | --- | --- |
-| ThreadSanitizer over concurrent insert and read | clean, at 1, 4, 16, and 64 threads | met: clean at all four. The 64-thread case did not complete for two phases; the cause was the test's own start barrier, not the structure, and `results/phase4-ordered-kernels.txt` has the correction |
+| ThreadSanitizer over concurrent insert and read | clean, at 1, 4, 16, and 64 threads | met: clean at all four, on every run. The 64-thread case did not complete for two phases; the start barrier was one real cause and fixing it made the case terminate, but it was not the whole cause and the cost is heavy-tailed — 9 s to 524 s for identical work on one idle host. `docs/phase4-eval.md` has the corrected account |
 | Surrogate collision rate | measured on at least one realistic key distribution, not synthetic sequential keys | met, on seven; the result invalidated the leading-bytes surrogate and forced prefix truncation |
 | Ordering decision | ordered structure or sort-on-flush, decided and written down | met: ordered |
 | Node layout | verified 64-byte aligned and 64 bytes in size by static_assert | met |
@@ -272,12 +272,40 @@ Report the environment: CPU model, core and socket count, whether SMT and turbo 
 version, and RocksDB commit. Pin `db_bench` threads and disable frequency scaling for the runs that
 go in the paper.
 
-| Exit criterion | Target |
-| --- | --- |
-| Thread scaling curve | Aparajita versus skiplist versus VectorRep at 1, 4, 16, 64 threads |
-| Regression check | no configuration where Aparajita loses to the skiplist without a stated reason |
-| Counter data | branch misses, L1 misses, and HITM per operation for each rep |
-| Reproducibility | a script that reruns the full suite from a clean checkout |
+Results and analysis in [docs/phase4-eval.md](docs/phase4-eval.md), numbers in
+[results/phase4-evaluation.txt](results/phase4-evaluation.txt); reproduce with
+`./scripts/build_rocksdb_plugin.sh && ./scripts/run_phase4.sh`.
+
+| Exit criterion | Target | Result |
+| --- | --- | --- |
+| Thread scaling curve | Aparajita versus skiplist versus VectorRep at 1, 4, 16, 64 threads | met, with a stated limit: quota capped the host at 12 physical cores, so 16 and 64 threads are contention rather than headroom |
+| Regression check | no configuration where Aparajita loses to the skiplist without a stated reason | met: no loss outside run-to-run spread. `fillrandom` at 16 and 64 threads is a tie, and the reason is that both reps are bounded by RocksDB's write-thread group there |
+| Counter data | branch misses, L1 misses, and HITM per operation for each rep | partial: branch misses and L1 misses collected for all three reps. HITM was not collectable — GCP's API rejects the `enhanced` vPMU tier, and under `standard` the event programs and silently counts zero because the hypervisor does not implement PEBS |
+| Reproducibility | a script that reruns the full suite from a clean checkout | met: `scripts/run_phase4.sh` and `scripts/phase4_summarize.py` |
+
+The read result is the headline and it is uniform: ahead of the skiplist at every
+thread count on both read benchmarks, 22-39% on `readrandom` and 23-38% on
+`readwhilewriting`, with non-overlapping samples across ten runs per cell. The
+counters back it at 55% fewer retired instructions and 40% fewer L1 misses per
+lookup.
+
+The write result needed restating rather than reporting. `fillrandom` is +18.8% at
+one thread and a tie at 16 and 64 — but *neither* rep scales there, and a
+`fillrandom` operation at 16 threads retires 22,182 instructions, which no memtable
+insert costs. Multi-threaded `db_bench fillrandom` on this core count is measuring
+RocksDB's write-thread group with the memtable as a rounding error.
+`memtablerep_bench`, which has no write group, puts the skiplist 48% behind on
+insert and holds that across all four thread counts. The claim the project can
+support is therefore "the rep inserts about half again as fast, visible at one
+thread and in `memtablerep_bench`, and swamped by RocksDB's write path in
+multi-threaded `db_bench`" — not a multi-threaded `db_bench` write win.
+
+Two things this phase corrected rather than measured. The first run divided
+`--num` by the thread count to hold total work constant, which also divides the
+keyspace, so the memtable held 1.26M distinct keys at 1 thread and 125k at 16 and
+the read curve was partly a working-set sweep. And the ThreadSanitizer cost
+recorded at the end of the previous phase was a draw from a heavy tail, not a
+result; see below.
 
 ## Phase 5: paper and upstream pitch
 
