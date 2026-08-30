@@ -2,6 +2,9 @@
 \documentclass[conference]{IEEEtran}
 \IEEEoverridecommandlockouts
 
+% T1 keeps the legacy Times metrics IEEEtran is designed around; without it a
+% Unicode engine falls back to substituted shapes and sets the tables wider.
+\usepackage[T1]{fontenc}
 \usepackage{cite}
 \usepackage{amsmath}
 \usepackage{amssymb}
@@ -13,10 +16,16 @@
 \def\BibTeX{{\rm B\kern-.05em{\sc i\kern-.025em b}\kern-.08em
     T\kern-.1667em\lower.7ex\hbox{E}\kern-.125emX}}
 
+% Long C++ identifiers are unbreakable boxes in a 3.5-inch column. Giving TeX
+% more tolerance lets it choose a break sequence that avoids one very loose
+% line rather than distributing the slack.
+\tolerance=2000
+\emergencystretch=2em
+
 \begin{document}
 
-\title{Aparajita: Branchless SIMD Search and Append-Only\\
-       Nodes for LSM-Tree MemTables}
+\title{Aparajita: Branchless SIMD Search and\\
+       Append-Only Nodes for LSM-Tree MemTables}
 
 \author{\IEEEauthorblockN{Parth Kumar Sinha}
 \IEEEauthorblockA{Independent Researcher\\
@@ -467,7 +476,7 @@ exactly the mispredictions the design removes.
 \begin{table}[t]
 \caption{Search kernels, cycles per probe, hit ratio 0.5}
 \label{tab:kernels}
-\centering
+\centering\small\setlength{\tabcolsep}{4pt}
 \begin{tabular}{lrrrr}
 \toprule
 kernel & cyc/probe & ins/probe & br/probe & miss/probe \\
@@ -567,7 +576,7 @@ consumes 100.6 rather than 445.4 bytes of arena per key.
 \begin{table}[t]
 \caption{Marginal cost per operation, 16 threads}
 \label{tab:counters}
-\centering
+\centering\footnotesize\setlength{\tabcolsep}{2.5pt}
 \begin{tabular}{llrrrr}
 \toprule
 benchmark & rep & instr & br miss & br miss \% & L1 miss \\
@@ -579,8 +588,8 @@ benchmark & rep & instr & br miss & br miss \% & L1 miss \\
 \texttt{readrandom} & Aparajita &  3271.5 &  8.46 & 1.241 &  62.18 \\
                     & skip list &  7349.9 & 10.39 & 0.727 & 103.99 \\
 \midrule
-\texttt{readwhile-} & Aparajita &  3622.2 &  9.53 & 1.265 &  72.41 \\
-\texttt{writing}    & skip list &  7597.6 & 11.93 & 0.808 & 110.70 \\
+\texttt{readwhilewriting} & Aparajita &  3622.2 &  9.53 & 1.265 &  72.41 \\
+                          & skip list &  7597.6 & 11.93 & 0.808 & 110.70 \\
 \bottomrule
 \end{tabular}
 \end{table}
