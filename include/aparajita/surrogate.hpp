@@ -45,8 +45,10 @@ inline std::uint32_t surrogate(std::string_view key) noexcept {
 // RocksDB users actually write. A table prefix, a tenant id, or a big-endian
 // timestamp puts identical bytes at the front of every key in the database, and
 // a lane holding those bytes discriminates nothing. bench/collision_report.cpp
-// measures it: six of seven realistic distributions collapse to a single
-// surrogate value.
+// measures it: five of eight realistic distributions collapse to a single
+// surrogate value across 200,000 keys, and one of those five is db_bench's own
+// default keyspace, which is what every RocksDB number in this project is
+// measured on.
 //
 // The escape is that the lane never needed to be order-preserving globally. A
 // search descends to the right node by comparing full keys, so the surrogate is

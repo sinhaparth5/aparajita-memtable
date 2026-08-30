@@ -1,0 +1,29 @@
+RocksDB:    version 9.11.2
+Date:       Sun Aug 30 18:28:11 2026
+CPU:        24 * INTEL(R) XEON(R) PLATINUM 8581C CPU @ 2.30GHz
+CPUCache:   266240 KB
+Initializing RocksDB Options from the specified file
+Initializing RocksDB Options from command-line flags
+Integrated BlobDB: blob cache disabled
+Keys:       16 bytes each (+ 0 bytes user-defined timestamp)
+Values:     100 bytes each (50 bytes after compression)
+Entries:    2000000
+Prefix:    0 bytes
+Keys per prefix:    0
+RawSize:    221.3 MB (estimated)
+FileSize:   125.9 MB (estimated)
+Write rate: 0 bytes/second
+Read rate: 0 ops/second
+Compression: NoCompression
+Compression sampling rate: 0
+Memtablerep: SkipListFactory
+Perf Level: 1
+------------------------------------------------
+Initializing RocksDB Options from the specified file
+Initializing RocksDB Options from command-line flags
+Integrated BlobDB: blob cache disabled
+DB path: [/tmp/aparajita-phase5-db]
+fillrandom   :       2.127 micros/op 470099 ops/sec 4.254 seconds 2000000 operations;   52.0 MB/s
+DB path: [/tmp/aparajita-phase5-db]
+seekrandom   :       3.034 micros/op 329611 ops/sec 1.517 seconds 500000 operations; (316075 of 500000 found)
+sst_files: 1

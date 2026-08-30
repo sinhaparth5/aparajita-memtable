@@ -135,7 +135,7 @@ Deleting it and running them confirmed exactly that — a clean pass.
 
 `tests/test_memtable.cpp` now carries a workload where the tie is universal: 3,000
 keys behind a thirteen-byte `tenant:00042:` prefix, which is the shape
-`bench/collision_report.cpp` found in six of seven realistic key distributions.
+`bench/collision_report.cpp` finds in most realistic key distributions.
 Every node in that structure has an identical hint, so nothing can be answered by
 the fast path. With the fallback removed it fails immediately and loudly. A second,
 smaller case covers keys that agree on exactly eight bytes and diverge afterwards,

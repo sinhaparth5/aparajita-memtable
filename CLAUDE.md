@@ -15,6 +15,7 @@ ctest --test-dir build -E tsan --output-on-failure   # see the caution below bef
 ./build/bench_search                             # Google Benchmark timings
 ./scripts/run_phase1.sh                          # Phase 1 only, writing results/
 ./scripts/run_phase4.sh                          # Phase 4 db_bench evaluation (needs the plugin built)
+./scripts/run_phase5.sh                          # Phase 5 seekrandom and flush cost (needs the plugin built)
 ```
 
 Four CTest targets, each also runnable directly for full output:
@@ -165,9 +166,13 @@ key extending it.
 
 **Surrogates are taken after the node's shared prefix, not from the start of the key.** This is the
 correction that measurement forced. A lane holding the first four bytes discriminates nothing on
-real keyspaces: six of seven realistic distributions in `collision_report` collapse to a single
+real keyspaces: five of the eight distributions in `collision_report` collapse to a single
 surrogate value across 200,000 keys, because a table prefix, a tenant id or a big-endian timestamp
-puts identical bytes at the front of every key in the database. The lane never needed to be
+puts identical bytes at the front of every key in the database. One of the five is `db_bench_default`,
+which reproduces db_bench's own key encoding and is therefore the keyspace every RocksDB measurement
+in this repository runs on; it was added in Phase 5 because the paper should not assume the
+evaluation's keyspace behaves, and an earlier "six of seven" reading of this table was wrong -- six
+of the original seven were *ineffective* globally, but only four held a single value. The lane never needed to be
 order-preserving globally, only within a node, so each `NodeData` stores `prefix_len` and takes
 surrogates past it. That restores every distribution to an effective lane. Two consequences live in
 the code: `fill()` recomputes the prefix from the first and last key at every split, since an
@@ -350,7 +355,9 @@ arriving after a split.
 results and the document together; a stale document is worse than no document. `results/` holds output from `./scripts/run_phase1.sh`, which covers Phase 1, and from
 `./scripts/run_phase4.sh`, which covers the Phase 4 evaluation and needs the plugin built first;
 `scripts/phase4_summarize.py` turns its raw output into the tables the documents quote, so those
-tables are generated rather than retyped. The Phase 2 numbers in `docs/phase2.md` came from ad-hoc
+tables are generated rather than retyped. `./scripts/run_phase5.sh` and `scripts/phase5_summarize.py`
+are the same arrangement for Phase 5's `seekrandom` and flush measurements, in
+`results/phase5-ordered/`. The Phase 2 numbers in `docs/phase2.md` came from ad-hoc
 runs of `collision_report` and `test_concurrent` and have no script yet. `results/archive-i5-8400h/` is a superseded run kept for
 the cross-generation comparison; never quote it as current. `-march=native`
 (`-DAPARAJITA_NATIVE=ON`) is for local measurement only, since it is not what ships and can silently
@@ -453,6 +460,27 @@ past 60 on sixteen cores, so it has to be run before or after the benchmarks and
 The project is dual-licensed under Apache 2.0 or MIT at the user's option, with the texts in
 `LICENSE-APACHE` and `LICENSE-MIT`. New source files should carry an SPDX header of
 `// SPDX-License-Identifier: Apache-2.0 OR MIT`.
+
+Phase 5 is the paper, and writing the claims down is what found the gaps. A peer review of the
+draft produced two measurements that had never been taken and four corrections that needed no
+measurement at all; `docs/phase5-ordered.md` records both halves and
+`results/phase5-ordered/` holds the data.
+
+**Seek wins and Next loses, and it is the same design decision doing both.** A `Seek` is 15.1% to
+28.6% ahead of the skiplist at 1/4/16/64 threads, tracking the point-lookup result, because a Seek is
+a descent plus a `lower_bound`. A `Seek` followed by ten `Next` calls is 3.0% to 4.3% *behind*,
+because the skiplist's `Next` is one pointer load along the level-0 chain while ours decodes a rank
+from the order word, indexes the slot that nibble names and follows a key pointer. The sorted order
+being a computed permutation is exactly what makes an insert one release store, so this is a price
+and not a bug. Do not quote a scan win. Decoding several ranks per `Next` is the obvious repair and
+was deliberately left for its own phase.
+
+**Arena overhead lands on L0 files, not on flush time.** At a 64 MiB write buffer Aparajita fits
+285,714 keys per memtable against the skiplist's 400,000 and writes 7 L0 files against 5, which is
+the 1.40x that `docs/phase4b-append.md` predicted from a different host. Flushing more often does not
+mean flushing more: the per-key flush cost is 0.425 against 0.441 microseconds. The unmeasured cost
+is compaction and write stalls from 40% more L0 files, which every configuration in this project
+disables. That is the most likely place this design still loses overall.
 
 ## What the project is
 

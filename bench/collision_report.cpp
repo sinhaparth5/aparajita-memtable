@@ -155,6 +155,27 @@ std::vector<std::string> gen_sequential_bigendian(std::size_t n, std::mt19937_64
     return v;
 }
 
+std::vector<std::string> gen_db_bench(std::size_t n, std::mt19937_64&) {
+    // The keyspace every RocksDB figure in this project is measured on, so that the
+    // evaluation's own key distribution appears in this table rather than being
+    // assumed to behave. db_bench's GenerateKeyFromInt writes the key ordinal
+    // big-endian into the first eight bytes of a sixteen-byte key and pads the rest
+    // with '0'. At the two million keys the evaluation uses the ordinal never
+    // reaches 2^21, so the leading five bytes are 0x00 on every key in the database
+    // and an absolute four-byte lane holds one value for the whole keyspace.
+    std::vector<std::string> v;
+    v.reserve(n);
+    for (std::size_t i = 0; i < n; ++i) {
+        std::string s(16, '0');
+        const std::uint64_t ord = static_cast<std::uint64_t>(i);
+        for (int b = 0; b < 8; ++b) {
+            s[static_cast<std::size_t>(b)] = static_cast<char>((ord >> (8 * (7 - b))) & 0xFF);
+        }
+        v.push_back(std::move(s));
+    }
+    return v;
+}
+
 std::vector<std::string> gen_tenant_prefixed(std::size_t n, std::mt19937_64& rng) {
     // The shape the design doc warns about: a small set of prefixes shared across
     // an entire keyspace, which is how multi-tenant and per-table keys are built.
@@ -220,6 +241,7 @@ int main(int argc, char** argv) {
         {"timestamp_series", gen_timestamp},
         {"sequential_decimal", gen_sequential},
         {"single_prefix", gen_single_prefix},
+        {"db_bench_default", gen_db_bench},
     };
 
     std::printf("surrogate collision report: first 4 key bytes, big-endian\n");
