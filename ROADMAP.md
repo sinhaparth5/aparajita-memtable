@@ -223,12 +223,12 @@ Findings in [docs/phase4b-append.md](docs/phase4b-append.md), numbers in
 | Exit criterion | Target | Result |
 | --- | --- | --- |
 | Arena per insert | an insert that does not allocate | met: allocation only at splits; 445.4 -> 100.6 B/key standalone, and 2.1x more keys resident per memtable under RocksDB |
-| Write throughput | ahead of the skiplist | met: `fillrandom` 8.256 -> 5.955 us/op, from 26.9% behind to 8.1% ahead |
-| Read throughput | no worse | met: `readrandom` 2.779 -> 2.324 us/op, 19.6% ahead, from the locality the smaller arena buys |
+| Write throughput | ahead of the skiplist | met: `fillrandom` 7.035 -> 5.531 us/op, from 24.5% behind to 2.0% ahead |
+| Read throughput | no worse | met: `readrandom` 1.440 -> 1.251 us/op, 26.6% ahead, from the locality the smaller arena buys |
 | Publication atomicity | a reader never sees a torn node | met by construction: one release store, and nothing it names is ever revised |
 | Ordered kernels | checked against a reference, not inferred from the structure | met: `lower_bound_perm_*` registered in `tests/test_search.cpp`; four kernel mutations that pass the differential suite fail there |
 | Invariants no query can observe | a test that fails when they break | met: `BasicMemTable::check_invariants`, called from both structure tests |
-| Concurrent read/write | not regressed | not met: `readwrite` is 13% slower than copy-on-write, the cost of a writer dirtying a line readers hold. Still 35% ahead of the skiplist; quantifying it wants HITM counters and belongs to Phase 4 |
+| Concurrent read/write | not regressed | not met: `readwrite` is 14.3% slower than copy-on-write, the cost of a writer dirtying a line readers hold. Still 33.5% ahead of the skiplist; quantifying it wants HITM counters and belongs to Phase 4 |
 
 Two things this phase deliberately did not do. The per-node spinlock still guards an insert, even
 though it now covers three stores rather than an allocation and a merge, because changing the
