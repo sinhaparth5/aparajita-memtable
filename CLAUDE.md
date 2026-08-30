@@ -177,9 +177,13 @@ unused rank decodes to slot 15, the lane no key occupies and every node keeps at
 permuted node is sentinel-padded for free. Do not "recover" the sixteenth slot without reading the
 last section of the design document first.
 
-Slot order is insertion order, so the lanes are not sorted in memory and `lower_bound` permutes them
-into rank order before comparing: `lower_bound_perm_avx512` does it with one `vpermd`, the AVX2 kernel
-with four permutes and two blends. The load is masked to the live slots, and that mask is about
+Slot order is insertion order, so the lanes are not sorted in memory -- and the ordered kernel does
+not care. `lower_bound` returns the number of live keys below the target, and a count over a set does
+not depend on how the set is arranged, so the permutation into rank order that these kernels used to
+perform produced a different vector and the same popcount. It is gone. What needs sortedness is the
+prefix-of-set-bits property, and the kernel reads only the popcount, never the mask's shape. The
+order word now feeds the kernel one thing, `count`, and the load is masked to the live slots; that
+mask is about
 concurrency, not about the answer -- a writer is storing into slot `count` while the kernel runs, and
 an unmasked 64-byte load would race with it. No test can catch its removal and neither can TSan,
 which does not instrument the vector load; the mask is justified by the memory model alone.
@@ -265,21 +269,24 @@ skiplist. Four deliberate kernel bugs passed the entire differential suite and f
 `results/phase4-ordered-kernels.txt`; they measured equality only until then, which meant every
 published cycle count was for a kernel the structure had stopped calling at Phase 4b.
 
-The number that came out of closing that gap is worth knowing before touching these kernels.
-Permuting is not free, and it is far from free on AVX2: `lower_bound_avx512` 4.04 cycles per probe
-against `lower_bound_perm_avx512` 8.12 (2.0x), and `lower_bound_avx2` 5.10 against
-`lower_bound_perm_avx2` 21.03 (4.1x, 25 instructions against 70). AVX2 has no 16-lane crossing
-permute, so it pays four permutes and two blends where AVX-512 pays one `vpermd`. At 21.03 cycles
-the AVX2 permuted kernel is 2.4x *slower* than `lower_bound_scalar_branchless` at 8.67 over a
-sorted node, so on an AVX2-only host the SIMD ordered kernel loses to a scalar one. It is still
-branchless -- 0.0000 misses per probe -- and it still beats the branchy baselines, and Phase 4b's
-db_bench win stands because it came from arena locality rather than from the probe. But the
-append-only layout has a read-side price, it had never been quoted, and it is four times larger on
-the ISA that ships.
+Closing that gap immediately paid for itself, and not in the way the numbers first suggested. The
+measured cost of permuting was 4.04 -> 8.12 cycles per probe on AVX-512 and 5.10 -> 21.03 on AVX2,
+which put the AVX2 permuted kernel 2.4x *behind* `lower_bound_scalar_branchless` over a sorted node.
+Chasing that led to the realisation that the permutation was not needed at all, and it has been
+removed; the paragraph above explains why. Those figures are therefore the cost of work the kernels
+no longer do. **The permuted family has not been re-measured since the removal**, so
+`results/phase4-ordered-kernels.txt` quotes the pre-removal kernels and nothing in the tree yet
+quotes the post-removal ones. Re-run `counter_report` on a rented host before citing an ordered
+number anywhere.
 
 `workload::make_append_node` builds the shape the permuted kernels are measured on: slots in a
-random order with `kPadSlot` at `kEmptyKey`. Measuring them on a sorted node instead makes the
-permutation the identity and the `vpermd` free, which is a benchmark of nothing.
+random order with `kPadSlot` at `kEmptyKey`. It mattered more when the kernels permuted, but it is
+still the honest shape and still what the structure holds.
+
+`lower_bound_perm_scalar` is deliberately left walking ranks through `order_slot`, so it remains a
+reference that genuinely depends on the order word. That is what makes the randomized trials in
+`test_search.cpp` a standing check that dropping the permutation is valid, rather than a comment
+asserting it. Do not "simplify" it to match the vector kernels.
 
 All three carry a `runnable` flag derived from `detect_isa()`. The ISA guards are not optional
 bookkeeping: an unguarded AVX-512 kernel executes and faults on a host that lacks it.

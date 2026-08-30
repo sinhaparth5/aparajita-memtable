@@ -9,6 +9,15 @@ Measured on a rented host, not the development laptop, per the rule in CLAUDE.md
 Two things were closed here, both of them prerequisites for Phase 4 rather than
 Phase 4 itself.
 
+SUPERSEDED IN PART, AND BY ITS OWN RESULT. The lower_bound_perm_* rows below are
+the kernels as they stood when this was measured, and measuring them is what
+showed the permutation they perform was unnecessary: lower_bound returns a count
+of the live keys below the target, and a count does not depend on how they are
+arranged. The permutation has been removed. Everything below is the cost of work
+the kernels no longer do -- kept because it is the evidence that led to the
+removal, not because it describes the current tree. The permuted family has NOT
+been re-measured since; do not quote an ordered cycle count from here as current.
+
 
 1. The counter harness now covers the kernel the structure runs
 ==============================================================

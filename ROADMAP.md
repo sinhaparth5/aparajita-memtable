@@ -214,8 +214,9 @@ again; the sorted order over the slots is fifteen four-bit indices in one 64-bit
 republishing that word is the whole of an insert. The word is self-describing -- the count is the
 position of its highest nonzero nibble -- which is what keeps the publication a single store, and
 the slot the `slot + 1` encoding gives up becomes the padding lane the ordered kernels need. Slot
-order is not sorted order, so `lower_bound` permutes the lanes into rank order first: one `vpermd`
-on AVX-512, four permutes and two blends on AVX2.
+order is not sorted order, and the ordered kernel turned out not to care: `lower_bound` counts the
+live keys below the target, and a count does not depend on the arrangement. The permutation Phase 4b
+introduced was removed once the counters made its cost visible.
 
 Findings in [docs/phase4b-append.md](docs/phase4b-append.md), numbers in
 [results/phase4b-append.txt](results/phase4b-append.txt).
@@ -227,18 +228,19 @@ Findings in [docs/phase4b-append.md](docs/phase4b-append.md), numbers in
 | Read throughput | no worse | met: `readrandom` 1.440 -> 1.251 us/op, 26.6% ahead, from the locality the smaller arena buys |
 | Publication atomicity | a reader never sees a torn node | met by construction: one release store, and nothing it names is ever revised |
 | Ordered kernels | checked against a reference, not inferred from the structure | met: `lower_bound_perm_*` registered in `tests/test_search.cpp`; four kernel mutations that pass the differential suite fail there |
-| Cost of the permutation | measured against the sorted kernel, not argued | met, after the fact: 2.0x on AVX-512 and 4.1x on AVX2 (`results/phase4-ordered-kernels.txt`). It was not measured during Phase 4b, because the counter harness covered equality only |
+| Cost of the permutation | measured against the sorted kernel, not argued | met, after the fact, and the answer retired the permutation: 2.0x on AVX-512 and 4.1x on AVX2 (`results/phase4-ordered-kernels.txt`) bought nothing, because a popcount is blind to order. Removed; awaiting a re-measure |
 | Invariants no query can observe | a test that fails when they break | met: `BasicMemTable::check_invariants`, called from both structure tests |
 | Concurrent read/write | not regressed | not met: `readwrite` is 14.3% slower than copy-on-write, the cost of a writer dirtying a line readers hold. Still 33.5% ahead of the skiplist; quantifying it wants HITM counters and belongs to Phase 4 |
 
-One thing this phase did not know it was buying. The counter harness covered the equality kernels
-only, so the price of permuting the lanes went unmeasured until the Phase 4 prerequisites were
-closed: 4.04 -> 8.12 cycles per probe on AVX-512, and 5.10 -> 21.03 on AVX2, where the missing
-16-lane crossing permute costs four permutes and two blends. The db_bench win stands, because it
-came from arena locality rather than from the probe, but on an AVX2-only host the permuted SIMD
-kernel is now slower than `lower_bound_scalar_branchless`. That is a live question for Phase 4 and
-it sharpens the AVX-512 one in "Open technical questions" from an availability argument into a
-measured 2.6x.
+One thing this phase did not know it was buying, and it was buying nothing. The counter harness
+covered the equality kernels only, so the price of permuting the lanes went unmeasured until the
+Phase 4 prerequisites were closed: 4.04 -> 8.12 cycles per probe on AVX-512, and 5.10 -> 21.03 on
+AVX2, where the missing 16-lane crossing permute costs four permutes and two blends. Asking what
+that bought produced the answer that it bought nothing — `lower_bound` returns a count of the live
+keys below the target, and a count is blind to how they are arranged, so the permuted vector and the
+unpermuted one have the same popcount. The kernels no longer permute. `docs/phase4b-append.md` keeps
+the original argument with the correction beside it. The db_bench win was never at stake either way:
+it came from arena locality rather than from the probe.
 
 Two things this phase deliberately did not do. The per-node spinlock still guards an insert, even
 though it now covers three stores rather than an allocation and a merge, because changing the
@@ -301,10 +303,10 @@ preserve order and allow a range scan to use the same kernel; a hash distributes
 the unordered design above.
 
 AVX2 as the shipped baseline with AVX-512 as an opportunistic path, or AVX-512 as a requirement.
-This is no longer a small gap. On the ordered kernel the structure actually runs, AVX-512 is 2.6x
-faster than AVX2 -- 8.12 against 21.03 cycles per probe -- because AVX2 has no 16-lane crossing
-permute and pays four permutes and two blends for one `vpermd`. On the equality kernel the gap was
-20% and the choice was nearly free; on the permuted kernel the AVX2 path loses to a scalar one.
+This briefly looked decisive and then stopped being. With the permutation in place AVX-512 was 2.6x
+faster than AVX2 on the ordered kernel — 8.12 against 21.03 cycles per probe — because AVX2 had to
+emulate a 16-lane crossing permute it does not have. Removing the permutation removed the emulation,
+so the gap should fall back towards the equality kernel's, though that has not been re-measured.
 Phase 1 weakened half the case for caution: the AVX-512 kernel is 20% faster than AVX2 (4.04
 against 5.01 cycles per probe, 15 retired instructions against 20) and showed no downclocking at
 all on Emerald Rapids, which is expected for light integer 512-bit work rather than the sustained
