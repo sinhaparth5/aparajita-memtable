@@ -20,6 +20,8 @@
 #include <thread>
 #include <vector>
 
+#include "db/dbformat.h"
+#include "db/memtable.h"
 #include "port/stack_trace.h"
 #include "rocksdb/comparator.h"
 #include "rocksdb/convenience.h"
@@ -214,6 +216,30 @@ TEST_F(AparajitaMemTableTest, AdvertisesConcurrentInsertSupport) {
   EXPECT_TRUE(factory.IsInsertConcurrentlySupported());
   EXPECT_STREQ(factory.Name(), "AparajitaMemTableFactory");
   EXPECT_STREQ(factory.NickName(), "aparajita");
+}
+
+// The descent's hint fast path is a promise about the comparator, and the
+// differential tests above cannot see it: with the fast path wrongly disabled
+// every one of them still passes, only slower. So pin the answer directly.
+//
+// The reverse case is the one that must never drift. It is not a missed
+// optimisation but a wrong descent, and it is why MatchesSkipListUnderReverse-
+// Comparator above is the test that would fail if this returned true.
+TEST_F(AparajitaMemTableTest, HintOrderingFollowsTheUserComparator) {
+  const InternalKeyComparator bytewise(BytewiseComparator());
+  const InternalKeyComparator reverse(ReverseBytewiseComparator());
+  MemTable::KeyComparator bytewise_key_cmp(bytewise);
+  MemTable::KeyComparator reverse_key_cmp(reverse);
+
+#ifdef ROCKSDB_USE_RTTI
+  EXPECT_TRUE(AparajitaHintOrdering(bytewise_key_cmp));
+#else
+  // Without RTTI the comparator cannot be identified and the fast path is off.
+  // Tests only build in Debug, where RocksDB defines ROCKSDB_USE_RTTI, so this
+  // branch exists to state the contract rather than because it is exercised.
+  EXPECT_FALSE(AparajitaHintOrdering(bytewise_key_cmp));
+#endif
+  EXPECT_FALSE(AparajitaHintOrdering(reverse_key_cmp));
 }
 
 // The plugin registry generated from aparajita.mk is what makes

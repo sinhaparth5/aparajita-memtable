@@ -34,8 +34,9 @@ moves.
 
 ## Where the repo stands
 
-The tree holds the architecture document, this roadmap, a `CLAUDE.md`, a README, both license
-texts, and a CMake/CLion `.gitignore`. No source, no build system, no tests.
+*This section described the tree before Phase 1 and is kept for the record; `CLAUDE.md` has the
+current state.* The tree held the architecture document, this roadmap, a `CLAUDE.md`, a README, both
+license texts, and a CMake/CLion `.gitignore`. No source, no build system, no tests.
 
 Licensing is settled: dual Apache 2.0 or MIT at the user's option, following the convention of
 paired `LICENSE-APACHE` and `LICENSE-MIT` files with the election stated in the README. Source
@@ -171,6 +172,47 @@ That reorders Phase 4. Running the full evaluation against a rep that loses by
 17-33% would only document the loss, so the structural work named at the end of
 docs/phase3.md comes first: make the descent cheap rather than only the leaf,
 and stop copying a node per insert.
+
+## Phase 4a: making the descent cheap
+
+Goal: stop a lookup paying thirty virtual comparator calls to reach a node the SIMD kernel then
+searches in four.
+
+The premise Phase 3 left behind needed measuring rather than estimating, and the measurement moved
+it: a lookup over 500,000 keys examines thirty successors, not the eight `docs/phase3.md` guessed,
+and each one was a chain of three dependent random loads ending in a virtual call. Each node now
+caches the first eight bytes of its first key in its header, so a hop compares two integers in a
+cache line it has already loaded, and only a tie falls through to the comparator.
+
+The interesting constraint is that the hint reproduces bytewise order and the comparator is the
+authority, so the fast path has to be switched off under any other comparator. Establishing that
+from inside a `MemTableRep` needs RTTI, which RocksDB's Release build disables by default. Probing
+the comparator and generalising was rejected: a wrong hop is not a slow lookup, it is a lost key.
+
+Findings in [docs/phase4-descent.md](docs/phase4-descent.md), numbers in
+[results/phase4-descent.txt](results/phase4-descent.txt).
+
+| Exit criterion | Target | Result |
+| --- | --- | --- |
+| Descent cost | measured, not estimated, before and after | met: 30.0 successors examined per lookup at 500k keys, at 11.3/16 average fill |
+| Correctness under a non-bytewise comparator | the fast path off, and proven off | met: `HintOrderingFollowsTheUserComparator`, plus the reverse-comparator differential test |
+| Fallback coverage | a test that fails if ties stop falling back to the comparator | met: the shared-prefix workload in `tests/test_memtable.cpp`, verified by deleting the fallback |
+| Read throughput | ahead of the skiplist on a memtable-resident workload | met |
+| Write throughput | ahead of the skiplist | not met: still behind, and the cause is Phase 4b's |
+
+## Phase 4b: stop copying a node per insert
+
+Goal: close the write gap, which is now the whole gap.
+
+Every insert rebuilds an entire node: a fresh 208-byte payload, sixteen surrogates recomputed, and
+the shared prefix re-derived from the first and last key. The skiplist links one node and returns.
+Copy-on-write bought the atomic split cheaply in Phase 2 and is charging for it on every write.
+
+The candidate is an append-only node with a published sort permutation. Sixteen four-bit slot
+indices fit exactly in one 64-bit word, which is enough to publish a new order in a single atomic
+store, so an insert becomes a couple of stores rather than a 208-byte rebuild. The per-node spinlock
+is worth reconsidering after that and not before, since its cost is only visible once the rebuild
+stops dominating.
 
 ## Phase 4: empirical evaluation
 

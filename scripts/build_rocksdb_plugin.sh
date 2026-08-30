@@ -18,6 +18,7 @@ ROCKSDB_TAG=${ROCKSDB_TAG:-v9.11.2}
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 ROCKSDB_SRC=${ROCKSDB_SRC:-$(dirname "$REPO_ROOT")/rocksdb-src}
 BUILD_DIR=${BUILD_DIR:-$ROCKSDB_SRC/build}
+DEBUG_BUILD_DIR=${DEBUG_BUILD_DIR:-$ROCKSDB_SRC/build-debug}
 JOBS=${JOBS:-$(nproc)}
 
 if [[ ! -d "$ROCKSDB_SRC" ]]; then
@@ -39,23 +40,50 @@ ln -s "$REPO_ROOT/plugin/aparajita" "$ROCKSDB_SRC/plugin/aparajita"
 # is selectable without modifying RocksDB sources, and that has to stay true.
 EXTRA_CXX_FLAGS="-include cstdint -include cstdio"
 
-echo "== configuring =="
+# Two trees, and the reason is not tidiness. RocksDB wraps WITH_TESTS in a
+# CMAKE_DEPENDENT_OPTION that forces it off unless CMAKE_BUILD_TYPE is exactly
+# Debug, so -DWITH_TESTS=ON on a Release build silently generates no test targets
+# at all and the build fails on an unknown target rather than on a missing flag.
+# Release is what db_bench should be measured in; Debug is the only place the
+# gtest exists, and it turns on RocksDB's internal asserts as a bonus.
+COMMON_CMAKE_ARGS=(
+    -DROCKSDB_PLUGINS=aparajita
+    -DCMAKE_CXX_STANDARD=20
+    -DCMAKE_CXX_FLAGS="$EXTRA_CXX_FLAGS"
+    -DWITH_GFLAGS=ON
+    -DWITH_SNAPPY=OFF -DWITH_LZ4=OFF -DWITH_ZLIB=OFF -DWITH_ZSTD=OFF -DWITH_BZ2=OFF
+    -DFAIL_ON_WARNINGS=OFF -DPORTABLE=1
+)
+
+echo "== configuring release tree =="
+# USE_RTTI is not incidental. The descent's hint fast path is only enabled when
+# the plugin can confirm the user comparator is the default bytewise one, and
+# MemTableRep::KeyComparator exposes no route to it other than a dynamic_cast --
+# see AparajitaHintOrdering(). RocksDB's Release build passes -fno-rtti by
+# default, which turns the fast path off and costs the descent roughly a third of
+# its speed. This is a supported cmake option, not a patch, and it applies to the
+# whole tree, so the skiplist this is benchmarked against is built the same way.
 cmake -S "$ROCKSDB_SRC" -B "$BUILD_DIR" \
-    -DROCKSDB_PLUGINS=aparajita \
+    "${COMMON_CMAKE_ARGS[@]}" \
     -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_CXX_STANDARD=20 \
-    -DCMAKE_CXX_FLAGS="$EXTRA_CXX_FLAGS" \
-    -DWITH_TESTS=ON -DWITH_BENCHMARK_TOOLS=ON -DWITH_GFLAGS=ON \
-    -DWITH_SNAPPY=OFF -DWITH_LZ4=OFF -DWITH_ZLIB=OFF -DWITH_ZSTD=OFF -DWITH_BZ2=OFF \
-    -DFAIL_ON_WARNINGS=OFF -DPORTABLE=1 \
+    -DUSE_RTTI=ON \
+    -DWITH_BENCHMARK_TOOLS=ON \
+    ${CMAKE_GENERATOR:+-G"$CMAKE_GENERATOR"}
+
+echo "== configuring debug tree =="
+cmake -S "$ROCKSDB_SRC" -B "$DEBUG_BUILD_DIR" \
+    "${COMMON_CMAKE_ARGS[@]}" \
+    -DCMAKE_BUILD_TYPE=Debug \
+    -DWITH_TESTS=ON \
     ${CMAKE_GENERATOR:+-G"$CMAKE_GENERATOR"}
 
 echo "== building =="
-cmake --build "$BUILD_DIR" -j"$JOBS" --target db_bench aparajita_memtable_test
+cmake --build "$BUILD_DIR" -j"$JOBS" --target db_bench
+cmake --build "$DEBUG_BUILD_DIR" -j"$JOBS" --target aparajita_memtable_test
 
 echo
 echo "== differential test against the skiplist rep =="
-"$BUILD_DIR/aparajita_memtable_test"
+"$DEBUG_BUILD_DIR/aparajita_memtable_test"
 
 echo
 echo "== db_bench selects the rep by name =="
@@ -67,6 +95,7 @@ rm -rf "$DB_PATH"
     --benchmarks=fillrandom,readrandom \
     --memtablerep=aparajita \
     --num=200000 --threads=4 --disable_wal=1 \
+    --compression_type=none \
     --db="$DB_PATH"
 rm -rf "$DB_PATH"
 

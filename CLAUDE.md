@@ -68,7 +68,7 @@ headers (`memory/allocator.h`, `db/lookup_key.h`) that `librocksdb-dev` does not
 RocksDB is pinned at v9.11.2 in that script. The `MemTableRep` interface is not stable across major
 versions, so bumping it means rereading `rocksdb/memtablerep.h` rather than assuming.
 
-Five things about that build cost real time to work out and none are obvious from the plugin README.
+Six things about that build cost real time to work out and none are obvious from the plugin README.
 
 Sources are declared in `aparajita.mk` only. RocksDB's CMake appends both the sources parsed out of
 the `.mk` and any `${plugin}_SOURCES` set by `CMakeLists.txt`, so declaring them in both compiles the
@@ -86,6 +86,15 @@ Tests only exist in a Debug build. RocksDB wraps `WITH_TESTS` in a `CMAKE_DEPEND
 forces it off unless `CMAKE_BUILD_TYPE` is exactly `Debug`, so `-DWITH_TESTS=ON` on a Release build
 silently produces no test targets at all. The script keeps a Release tree for `db_bench` and a
 separate Debug tree for `aparajita_memtable_test`, which also turns on RocksDB's internal asserts.
+
+The Release tree is built with `-DUSE_RTTI=ON`, and that is not incidental. The descent's hint fast
+path is enabled only when the plugin can confirm the user comparator is the default bytewise one,
+and `MemTableRep::KeyComparator` exposes no route to it other than a `dynamic_cast` to
+`MemTable::KeyComparator`. RocksDB compiles Release with `-fno-rtti` by default, which turns the
+fast path off and costs reads roughly 40%. `USE_RTTI` is a supported cmake option, not a patch, and
+it applies to the whole tree, so a comparison against `skip_list` in that tree is still fair. It is
+also the control the Phase 4a measurements use: two trees differing in that flag alone, with the
+skiplist rows as the evidence that the flag by itself moves nothing.
 
 RocksDB 9.11.2 does not compile with GCC 13 or newer without help: several headers use `uint64_t`
 without including `<cstdint>`. The build passes `-include cstdint` rather than patching RocksDB,
@@ -159,6 +168,30 @@ wrong answer, because the search only follows a pointer to a node whose first ke
 the target and nodes are ordered and never removed. It is not decoration. Before the tower existed
 the 64-thread test did not finish in two minutes; with it the set takes 0.7 seconds.
 
+**A tower hop compares an eight-byte hint in the node header, not the node's first key.** This is
+Phase 4a and it is what took reads past the skiplist; `docs/phase4-descent.md` argues it. Three
+invariants hold it up and each is easy to break by accident.
+
+The hint is immutable. `descend()` returns the last node whose first key is at or below the key
+being inserted, so an insert into a non-head node always sorts at position 1 or later and a split
+leaves the left half's first key alone. The head is the sole exception and is also the only node no
+hop ever moves *to*, so its hint is never read. Any change that lets a non-head node's first key
+decrease invalidates the whole scheme.
+
+A tie decides nothing. Equal hints fall through to the comparator, which is why the hint is eight
+bytes and the surrogate is four: a surrogate tie costs one comparison inside a node already in
+cache, a hint tie costs the miss chain the hint exists to avoid.
+
+`publish()` stores the hint before the payload, and the order is not stylistic. A first key never
+rises, so a new hint beside an old payload is a hint that is too small, and too small only ever lets
+a hop enter a node it was entitled to enter. The other order exposes a hint that is too large, and a
+hop then stops one node short of the key it wanted.
+
+The fast path is off unless `Traits::hint_ordering()` says the comparator agrees with bytewise order,
+because a wrong hop is not a slow lookup, it is a lost key. `tests/test_memtable.cpp` carries a
+shared-prefix workload where every hint ties, which is the only test in the tree that fails if the
+fallback is removed; random keys tie too rarely to notice.
+
 Readers are lock-free and never write. Writers take a per-node spinlock that pauses 64 times and
 then yields. This narrows the "lock-free concurrency" pillar and is recorded rather than hidden: a
 fully lock-free ordered insert has to shift keys inside a sorted node, which is not one atomic
@@ -168,8 +201,9 @@ a flat spin burns every other thread's slice while the lock holder waits to be s
 
 The layout that all of this protects is enforced by `static_assert`, not by comment: surrogates at
 offset 0, cold fields (`count`, `prefix_len`, `next`, the `string_view`s) beginning at offset 64,
-`NodeData` and `ListNode` both 64-byte aligned. `lower_bound_surrogate` reinterprets the surrogate
-array as a `Node` and depends on those assertions holding.
+`NodeData` and `ListNode` both 64-byte aligned, and `first_hint` within `ListNode`'s first line.
+`lower_bound_surrogate` reinterprets the surrogate array as a `Node` and depends on those assertions
+holding.
 
 ## Working on the search kernels
 
@@ -259,11 +293,17 @@ Phases 1 through 3 are complete. The SIMD kernels are correct and fast, the stan
 correct and concurrent, and Aparajita builds as a RocksDB plugin that `db_bench` selects by name and
 that matches the default skiplist byte for byte.
 
-It is also 17% slower than the skiplist on `fillrandom` and 33% slower on `readrandom`. That is the
-single most important fact about the current state and `docs/phase3.md` explains it: a lookup spends
-about eight tower hops reaching the right node, each a virtual comparator call on a full internal
-key, and the SIMD kernel only replaces the few comparisons inside the final sixteen-key node. Phase 4
-is therefore blocked on structural work, not on measurement.
+Phase 4 is under way and split in two. Phase 3 closed 17% behind the skiplist on `fillrandom` and
+33% behind on `readrandom`, because a lookup spent about thirty tower hops reaching the right node --
+not eight, as `docs/phase3.md` first estimated -- each one a virtual comparator call on a full
+internal key, while the SIMD kernel only replaced the handful of comparisons inside the final
+sixteen-key node.
+
+Phase 4a fixed the descent and is described in `docs/phase4-descent.md`. Each node caches the first
+eight bytes of its first key, so a tower hop compares two integers in a line it has already loaded
+and only falls back to the comparator on a tie. Reads are now ahead of the skiplist and writes are
+not; the remaining write cost is copy-on-write rebuilding a whole node per insert, which is Phase 4b.
+`results/phase4-descent.txt` has the numbers and the RTTI caveat that goes with them.
 
 What Phase 3 answered, and what it left open:
 

@@ -13,6 +13,16 @@
 
 namespace ROCKSDB_NAMESPACE {
 
+// Whether Aparajita's descent may answer a tower hop from an eight-byte hint
+// rather than a virtual comparator call, under `cmp`.
+//
+// Exposed here only so a test can pin it down. The property it reports is a
+// promise about the comparator, and a promise nothing checks is one that quietly
+// stops being true: without this, a change that made the answer false for the
+// default comparator would cost every descent its fast path and no test would
+// notice, because a disabled fast path is still correct.
+bool AparajitaHintOrdering(const MemTableRep::KeyComparator& cmp);
+
 class AparajitaMemTableFactory : public MemTableRepFactory {
  public:
   AparajitaMemTableFactory() = default;
