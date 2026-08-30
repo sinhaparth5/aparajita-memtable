@@ -27,12 +27,27 @@ surrogate multiplicities, where 1.0 is a perfect lane:
 | timestamp_series | 200000.0 | 1.0 |
 | sequential_decimal | 200000.0 | 1.0 |
 | single_prefix | 200000.0 | 1.0 |
+| db_bench_default | 200000.0 | 1.0 |
 
-The left column is the design as specified. Six of seven distributions collapse to
-a **single** surrogate value across 200,000 keys. A table prefix (`rows:`), a
-tenant id, a decimal counter with a fixed stem, or a big-endian timestamp all put
-identical bytes at the front of every key in the database. Only uniformly random
-binary keys work, and nobody writes those.
+The left column is the design as specified. Five of the eight distributions
+collapse to a **single** surrogate value across 200,000 keys, and a sixth,
+`tenant_prefixed`, leaves 201 expected comparisons per lookup. A table prefix
+(`rows:`), a tenant id, a decimal counter with a fixed stem, or a big-endian
+timestamp all put identical bytes at the front of every key in the database. Only
+uniformly random binary keys work, and nobody writes those.
+
+Two corrections to this table, both made in Phase 5 while auditing the paper's
+claims against the data behind them. This section used to say "six of seven",
+which was a misreading of its own table: six of the original seven are
+*ineffective* globally, taking the 1.5-comparison bar as the threshold, but only
+four hold a literal single value. And `db_bench_default` was added, because the
+paper's entire RocksDB evaluation runs on that keyspace and it should appear here
+as a measurement rather than as an assumption. It reproduces db_bench's
+`GenerateKeyFromInt`: the key ordinal big-endian in the first eight bytes of a
+sixteen-byte key, zero-padded, so below 2^21 keys the leading five bytes are
+identical throughout the database. It collapses like the rest, which means every
+RocksDB figure this project reports is measured on a keyspace where an absolute
+lane would have been useless.
 
 Had this been measured on sequential integers alone, as the roadmap warned, the
 result would have been either a clean pass or a total failure depending purely on

@@ -1,0 +1,15 @@
+date:      2026-08-30T18:26:39+00:00
+host:      aparajita-p5
+kernel:    Linux 6.17.0-1022-gcp
+cpu:       INTEL(R) XEON(R) PLATINUM 8581C CPU @ 2.30GHz
+vcpu:      24 logical
+cores:     12 per socket, 1 socket(s)
+smt:       1
+memory:    88 GiB
+isa:       avx512f
+gcc:       g++-14 (Ubuntu 14.2.0-4ubuntu2~24.04.1) 14.2.0
+rocksdb:   v9.11.2
+aparajita: not a git checkout
+keyspace:  2000000
+wbuf_A:    4294967296
+wbuf_B:    67108864

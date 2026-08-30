@@ -64,6 +64,9 @@ the mitigation second.
 Marked against `results/`. "Argued" means the reasoning is sound and no counter or
 benchmark isolates it.
 
+Six rows changed after the draft was reviewed and the gaps measured; see
+[phase5-ordered.md](phase5-ordered.md).
+
 | Claim | Status | Evidence |
 | --- | --- | --- |
 | Branch mispredictions removed from the probe | measured | 0.0000 miss/probe on every vector kernel, `counters.txt`, `phase4-ordered-kernels.txt` §3 |
@@ -81,6 +84,12 @@ benchmark isolates it.
 | Reads are lock-free | argued, race-checked | one release store by construction; TSan clean at 1/4/16/64 |
 | Writes are lock-free | **false as stated** | writers take a per-node spinlock; paper says so |
 | Iteration matches the skiplist | measured | differential test, byte for byte, incl. reverse comparator |
+| Seek beats the skiplist | measured | +15.1% to +28.6% at 1/4/16/64, `phase5-ordered/` |
+| Iteration is *faster* than the skiplist | **false** | Seek + 10 Next is 3.0-4.3% behind at every thread count |
+| Arena per key vs the skiplist | measured | 1.40x; 7 L0 files against 5 for the same 2M keys |
+| Flushing more often costs flush time | **false** | 0.425 vs 0.441 us per key flushed; the cost is L0 files, not flush |
+| Compaction cost of the extra L0 files | **unsupported** | every configuration here disables auto-compaction |
+| Six of seven distributions defeat an absolute surrogate | **misstated** | four hold a single value, six are ineffective; corrected everywhere |
 | Selectable without patching RocksDB | measured | `db_bench --memtablerep=aparajita` |
 | AVX-512 does not downclock for this mix | measured, narrow | `freq/nom` 1.741 across five runs, Emerald Rapids only |
 | AVX-512 is 20% faster than AVX2 | **contested** | inverts between runs; see above |
@@ -95,6 +104,12 @@ Four things now want the same box, which is one rental rather than four:
 - The equality kernel rerun that settles the AVX2 and AVX-512 inversion.
 - A `freq/nom` reading on a downclock-prone part, which Phase 1 left open and
   which the AVX-512 availability argument would be stronger for having.
+
+The Phase 5 trip did **not** carry any of them. It was scoped to `db_bench` and ran
+no counter passes, so all four are still open and still want one rental between
+them. What it closed instead were two gaps this audit had not thought to ask about:
+an ordered workload, and arena cost measured against the skiplist rather than
+against our own earlier design.
 
 None of them block the draft. All four are stated as limitations in it, and the
 draft is written so that closing any of them is an edit rather than a rewrite.

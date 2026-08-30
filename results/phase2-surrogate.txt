@@ -1,0 +1,22 @@
+surrogate collision report: first 4 key bytes, big-endian
+keys per distribution: 200000
+
+distribution                 global     per-node   verdict
+                           exp scan     exp scan
+------------------------------------------------------------------------
+random_binary                   1.0          1.0   SIMD effective
+uuid_hex                        4.0          1.0   SIMD effective
+sequential_bigendian       200000.0          1.0   SIMD effective
+tenant_prefixed               201.0          1.1   SIMD effective
+timestamp_series           200000.0          1.0   SIMD effective
+sequential_decimal         200000.0          1.0   SIMD effective
+single_prefix              200000.0          1.0   SIMD effective
+db_bench_default           200000.0          1.0   SIMD effective
+
+exp scan is the expected number of full-key comparisons per lookup,
+sum(m^2)/N over surrogate multiplicities. 1.0 is a perfect lane, 16
+means the lane discriminates nothing within a node.
+
+global   = surrogate taken from the start of the key
+per-node = taken after the prefix shared by one node's sixteen keys,
+           which is what memtable.hpp actually does

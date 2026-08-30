@@ -1,0 +1,71 @@
+Phase 5: ordered access, and what the arena costs when it has to flush
+
+date:      2026-08-30T18:26:39+00:00
+host:      aparajita-p5
+kernel:    Linux 6.17.0-1022-gcp
+cpu:       INTEL(R) XEON(R) PLATINUM 8581C CPU @ 2.30GHz
+vcpu:      24 logical
+cores:     12 per socket, 1 socket(s)
+smt:       1
+memory:    88 GiB
+isa:       avx512f
+gcc:       g++-14 (Ubuntu 14.2.0-4ubuntu2~24.04.1) 14.2.0
+rocksdb:   v9.11.2
+aparajita: not a git checkout
+keyspace:  2000000
+wbuf_A:    4294967296
+wbuf_B:    67108864
+
+== seekrandom, seek_nexts=0 (Seek alone), WAL off ==
+  threads      aparajita      skip_list    vs skip_list
+                  kops/s         kops/s
+        1          428.2          333.0           28.6%
+        4         1744.3         1368.8           27.4%
+       16         5688.7         4853.0           17.2%
+       64         7639.7         6636.1           15.1%
+
+  threads      aparajita      skip_list
+             min/med/max    min/med/max
+        1    409/428/545    329/333/335
+        4 1689/1744/2233 1354/1369/1703
+       16 5107/5689/6353 4526/4853/4901
+       64 6787/7640/8852 6228/6636/6922
+
+== seekrandom, seek_nexts=10 (Seek then 10 Next), WAL off ==
+  threads      aparajita      skip_list    vs skip_list
+                  kops/s         kops/s
+        1          191.7          197.6           -3.0%
+        4          744.1          769.6           -3.3%
+       16         2246.6         2348.0           -4.3%
+       64         3093.8         3217.5           -3.8%
+
+  threads      aparajita      skip_list
+             min/med/max    min/med/max
+        1    191/192/198    195/198/199
+        4    741/744/758    748/770/779
+       16 2187/2247/2257 2289/2348/2389
+       64 2966/3094/3158 3069/3218/3320
+
+  memtable-resident: no run produced more than the flush on close
+
+== arena cost and flush cost, 64 MiB write buffer, 1 thread ==
+Flushes are how a rep's arena per key becomes visible: fewer keys per
+memtable means more flushes for the same keyspace.
+
+         rep   fill us/op   L0 files   keys/flush   flush us/key
+   aparajita        1.031          7       285714          0.425
+   skip_list        1.313          5       400000          0.441
+
+  arena per key, Aparajita vs skiplist:  1.40x
+  L0 files for the same 2M keys:        1.40x
+  flush cost per key flushed:           0.96x
+
+  The extra files are the arena overhead made visible. They do not
+  cost extra flush time -- the same keys are written either way, at a
+  per-key cost that is within a few percent -- but they are more L0
+  files for compaction to merge, which this configuration disables and
+  therefore does not measure.
+
+Seek is the ordered workload the design is justified by and Phase 4 did
+not measure. Flush is the other half of the same question: the iterator
+that ordered iteration needs is also what a flush walks.
