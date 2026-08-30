@@ -21,6 +21,17 @@ namespace {
 
 int g_failures = 0;
 
+// Every invariant the structure maintains that no query can observe failing.
+// See BasicMemTable::check_invariants for why that set is not empty: a node whose
+// surrogate lanes are no longer sorted, or whose descent hint no longer matches
+// its first key, still answers every lookup in this file correctly.
+void audit(const MemTable& t, const char* where) {
+    if (const char* broken = t.check_invariants()) {
+        std::fprintf(stderr, "FAIL: %s: %s\n", where, broken);
+        ++g_failures;
+    }
+}
+
 void check(bool ok, const std::string& what) {
     if (!ok) {
         std::fprintf(stderr, "FAIL: %s\n", what.c_str());
@@ -112,6 +123,7 @@ int main() {
         MemTable t(arena);
         check(!t.contains("anything"), "empty table contains nothing");
         check(t.size() == 0, "empty table has size 0");
+        audit(t, "empty table");
     }
 
     // Enough keys to force many splits, inserted in a shuffled order so the
@@ -179,6 +191,8 @@ int main() {
                 }
             }
         }
+
+        audit(t, "5000 shuffled random keys");
     }
 
     // Keys sharing a four-byte prefix all collapse to one surrogate, so the
@@ -202,6 +216,7 @@ int main() {
         }
         check(t.size() == keys.size(), "shared-prefix keys all stored");
         check(!t.contains("PFX:99999"), "absent shared-prefix key misses");
+        audit(t, "four-byte shared prefix");
     }
 
     // Keys shorter than the lane, including the empty key.
@@ -219,6 +234,7 @@ int main() {
             }
         }
         check(t.size() == std::size(shorts), "all short keys stored");
+        audit(t, "keys shorter than the lane");
     }
 
     // Iteration in both directions, and the two seeks.
@@ -388,6 +404,8 @@ int main() {
                 check(it.valid() && it.key() == *lb, "shared-prefix seek lands on lower_bound");
             }
         }
+
+        audit(t, "3000 keys behind a thirteen-byte prefix");
     }
 
     // The other tie the hint cannot see: keys that agree on their first eight
@@ -424,6 +442,7 @@ int main() {
             }
         }
         check(ordered && i == sorted.size(), "eight-byte ties iterate in comparator order");
+        audit(t, "keys tying in their first eight bytes");
     }
 
     if (g_failures == 0) {

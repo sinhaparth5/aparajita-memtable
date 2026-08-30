@@ -223,6 +223,147 @@ inline int lower_bound_avx512(const Node& n, std::uint32_t key) noexcept {
 #endif // APARAJITA_X86
 
 // ---------------------------------------------------------------------------
+// Ordered search over an append-only node
+// ---------------------------------------------------------------------------
+//
+// The kernels above require the surrogates to be sorted in memory, which was
+// true while every insert rebuilt the node. Phase 4b stops rebuilding: a slot is
+// written once and the sorted order over the slots is republished as a 64-bit
+// order word (see node.hpp). The lane array is therefore in slot order, which is
+// insertion order, which is not sorted.
+//
+// Permuting it back is one instruction on AVX-512. `vpermd` takes exactly the
+// sixteen 32-bit indices the order word packs, so the sorted line is materialised
+// in a register and the prefix-mask popcount that made lower_bound branchless in
+// Phase 2 is unchanged behind it. AVX2 has no 16-lane crossing permute, so each
+// output half is gathered from both source halves and blended on the index's
+// high bit -- four permutes and two blends instead of one instruction, which is
+// the widest the two ISAs have diverged anywhere in this project.
+//
+// Two details do real work.
+//
+// Unused ranks decode to slot 15, and slot 15 is the padding lane no key ever
+// occupies, so the tail of the permuted line is kEmptyKey without a count, a
+// mask or a blend. That is what the order word's `slot + 1` encoding bought.
+//
+// The load is masked to the live slots even so, and that is about concurrency
+// rather than about the result. A writer appending to this node is storing into
+// slot `count` while these kernels run, and an unmasked 64-byte load would read
+// the bytes it is writing -- a data race, even though the permutation could not
+// select the lane. Masking to slots below `count` keeps the reader off it. The
+// merge source is kEmptyKey, which is what those slots already hold, so the mask
+// changes no answer this kernel can return.
+using LowerBoundPermFn = int (*)(const Node&, std::uint32_t, std::uint64_t) noexcept;
+
+// The reference the vector kernels are checked against. Branchy and unvectorized
+// for the same reason lower_bound_scalar is: a baseline the compiler has turned
+// into a vector kernel is not a baseline.
+inline int lower_bound_perm_scalar(const Node& n, std::uint32_t key,
+                                   std::uint64_t order) noexcept {
+    const int count = order_count(order);
+    int rank = 0;
+#if defined(__clang__)
+#pragma clang loop vectorize(disable)
+#elif defined(__GNUC__)
+#pragma GCC novector
+#endif
+    while (rank < count && n.keys[order_slot(order, rank)] < key) {
+        ++rank;
+    }
+    return rank;
+}
+
+#if APARAJITA_X86
+
+// Spreading sixteen nibbles into sixteen dwords is the only part that is not
+// obvious. Broadcasting the order word gives dwords that alternate low half and
+// high half; one permute reshapes that into "low half for ranks 0-7, high half
+// for ranks 8-15", after which a per-lane variable shift and a mask leave each
+// lane holding its own nibble. Subtracting one turns `slot + 1` into the slot and
+// carries an unused rank's zero to 15, the padding lane.
+__attribute__((target("avx512f")))
+inline int lower_bound_perm_avx512(const Node& n, std::uint32_t key,
+                                   std::uint64_t order) noexcept {
+    const __m512i ones = _mm512_set1_epi32(1);
+    const __m512i nibble = _mm512_set1_epi32(0xF);
+
+    const __m512i halves = _mm512_set1_epi64(static_cast<long long>(order));
+    const __m512i pick = _mm512_set_epi32(1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0);
+    const __m512i shifts = _mm512_set_epi32(28, 24, 20, 16, 12, 8, 4, 0,
+                                            28, 24, 20, 16, 12, 8, 4, 0);
+    const __m512i lanes = _mm512_permutexvar_epi32(pick, halves);
+    const __m512i nib = _mm512_and_si512(_mm512_srlv_epi32(lanes, shifts), nibble);
+    const __m512i idx = _mm512_and_si512(_mm512_sub_epi32(nib, ones), nibble);
+
+    const __mmask16 live = static_cast<__mmask16>((1u << order_count(order)) - 1u);
+    const __m512i line = _mm512_mask_load_epi32(_mm512_set1_epi32(static_cast<int>(kEmptyKey)),
+                                                live, reinterpret_cast<const void*>(n.keys));
+    const __m512i sorted = _mm512_permutexvar_epi32(idx, line);
+
+    const __mmask16 lt =
+        _mm512_cmplt_epu32_mask(sorted, _mm512_set1_epi32(static_cast<int>(key)));
+    return __builtin_popcount(static_cast<unsigned>(lt));
+}
+
+// _mm256_permutevar8x32_epi32 reads only the low three bits of each index, so
+// feeding it a 0-15 index twice -- once against each source half -- yields the
+// two candidate lanes, and the index's bit 3 says which to keep. That is the
+// whole of the 16-lane crossing permute AVX2 does not have.
+//
+// The unsigned-versus-signed trap in lower_bound_avx2 applies here unchanged:
+// _mm256_cmpgt_epi32 is signed, so both sides are biased by 0x80000000 or
+// kEmptyKey would read as -1 and sort below every real key.
+__attribute__((target("avx2")))
+inline int lower_bound_perm_avx2(const Node& n, std::uint32_t key,
+                                 std::uint64_t order) noexcept {
+    const __m256i ones = _mm256_set1_epi32(1);
+    const __m256i nibble = _mm256_set1_epi32(0xF);
+    const __m256i seven = _mm256_set1_epi32(7);
+    const __m256i shifts = _mm256_set_epi32(28, 24, 20, 16, 12, 8, 4, 0);
+    const __m256i pad = _mm256_set1_epi32(static_cast<int>(kEmptyKey));
+
+    const __m256i count = _mm256_set1_epi32(order_count(order));
+    const __m256i live_lo = _mm256_cmpgt_epi32(count, _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7));
+    const __m256i live_hi =
+        _mm256_cmpgt_epi32(count, _mm256_setr_epi32(8, 9, 10, 11, 12, 13, 14, 15));
+    const int* base = reinterpret_cast<const int*>(n.keys);
+    const __m256i src_lo =
+        _mm256_blendv_epi8(pad, _mm256_maskload_epi32(base, live_lo), live_lo);
+    const __m256i src_hi =
+        _mm256_blendv_epi8(pad, _mm256_maskload_epi32(base + 8, live_hi), live_hi);
+
+    const __m256i word_lo = _mm256_set1_epi32(static_cast<int>(static_cast<std::uint32_t>(order)));
+    const __m256i word_hi =
+        _mm256_set1_epi32(static_cast<int>(static_cast<std::uint32_t>(order >> 32)));
+    const __m256i idx_lo = _mm256_and_si256(
+        _mm256_sub_epi32(_mm256_and_si256(_mm256_srlv_epi32(word_lo, shifts), nibble), ones),
+        nibble);
+    const __m256i idx_hi = _mm256_and_si256(
+        _mm256_sub_epi32(_mm256_and_si256(_mm256_srlv_epi32(word_hi, shifts), nibble), ones),
+        nibble);
+
+    const __m256i sorted_lo =
+        _mm256_blendv_epi8(_mm256_permutevar8x32_epi32(src_lo, idx_lo),
+                           _mm256_permutevar8x32_epi32(src_hi, idx_lo),
+                           _mm256_cmpgt_epi32(idx_lo, seven));
+    const __m256i sorted_hi =
+        _mm256_blendv_epi8(_mm256_permutevar8x32_epi32(src_lo, idx_hi),
+                           _mm256_permutevar8x32_epi32(src_hi, idx_hi),
+                           _mm256_cmpgt_epi32(idx_hi, seven));
+
+    const __m256i bias = _mm256_set1_epi32(INT32_MIN);
+    const __m256i needle = _mm256_xor_si256(_mm256_set1_epi32(static_cast<int>(key)), bias);
+    const __m256i lt_lo = _mm256_cmpgt_epi32(needle, _mm256_xor_si256(sorted_lo, bias));
+    const __m256i lt_hi = _mm256_cmpgt_epi32(needle, _mm256_xor_si256(sorted_hi, bias));
+
+    const unsigned m_lo = static_cast<unsigned>(_mm256_movemask_ps(_mm256_castsi256_ps(lt_lo)));
+    const unsigned m_hi = static_cast<unsigned>(_mm256_movemask_ps(_mm256_castsi256_ps(lt_hi)));
+    return __builtin_popcount(m_lo | (m_hi << 8));
+}
+
+#endif // APARAJITA_X86
+
+// ---------------------------------------------------------------------------
 // Runtime dispatch
 // ---------------------------------------------------------------------------
 
@@ -261,6 +402,17 @@ inline LowerBoundFn lower_bound_dispatch() noexcept {
         case Isa::Avx2:   return &lower_bound_avx2;
 #endif
         default:          return &lower_bound_scalar_branchless;
+    }
+}
+
+// Same ISA decision again, for the permuted ordered kernels.
+inline LowerBoundPermFn lower_bound_perm_dispatch() noexcept {
+    switch (detect_isa()) {
+#if APARAJITA_X86
+        case Isa::Avx512: return &lower_bound_perm_avx512;
+        case Isa::Avx2:   return &lower_bound_perm_avx2;
+#endif
+        default:          return &lower_bound_perm_scalar;
     }
 }
 

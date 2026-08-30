@@ -109,7 +109,8 @@ without patching RocksDB. `memtablerep_bench` can, because it goes through `Crea
 
 `include/aparajita/` holds the public headers, and the library is header-only:
 
-- `node.hpp` for the 64-byte SIMD `Node` and the constants (`kCacheLine`, `kNodeKeys`, `kEmptyKey`)
+- `node.hpp` for the 64-byte SIMD `Node`, the constants (`kCacheLine`, `kNodeKeys`,
+  `kNodeCapacity`, `kEmptyKey`) and the order-word encoding a node publishes an insert with
 - `search.hpp` for the two kernel families and their runtime dispatch
 - `surrogate.hpp` for turning a variable-length key into the 32-bit value a lane holds
 - `arena.hpp` for the bump allocator standing in for `rocksdb::Allocator`
@@ -150,17 +151,39 @@ surrogate value across 200,000 keys, because a table prefix, a tenant id or a bi
 puts identical bytes at the front of every key in the database. The lane never needed to be
 order-preserving globally, only within a node, so each `NodeData` stores `prefix_len` and takes
 surrogates past it. That restores every distribution to an effective lane. Two consequences live in
-the code: `fill()` recomputes the prefix from the first and last key on every rebuild, since an
+the code: `fill()` recomputes the prefix from the first and last key at every split, since an
 insert at either end can shorten it and a stale prefix silently mis-orders every surrogate; and a
 key that does not share the node's prefix is placed by full comparison instead, which is
 correctness rather than a fallback optimisation.
 
-**`NodeData` is immutable once published, and the level-0 link lives inside it.** That is what
-makes a split atomic. Publishing the right half first and then swapping the left half's contents
-and its successor in a single release store means a reader sees either the old sixteen-key node or
-the new pair, never a state where a key is duplicated across both or missing from both. Moving
-`next` out into `ListNode` beside the tower would need two stores and would expose exactly those
-states. Do not move it.
+**A node is append-only, and the sorted order over its slots is a 64-bit word.** This is Phase 4b
+and it is what took writes past the skiplist; `docs/phase4b-append.md` argues it. A slot is written
+once, before the order word that names it, and never written again, so an insert is two stores into
+a free slot and one release store of the new order. Nothing already visible moves, and a reader that
+takes one acquire load of the order word holds a consistent node: everything that word names is
+frozen. Until Phase 4b every insert allocated and rebuilt a whole payload, which cost 445 bytes of
+arena per key against a live structure of 40.
+
+A nibble holds `slot + 1`, not the slot, so 0 means "unused rank". That costs one of the sixteen
+slots and buys the two things that make the scheme work. The word is self-describing -- the count is
+the position of its highest nonzero nibble -- so nothing needs a second store beside it. And an
+unused rank decodes to slot 15, the lane no key occupies and every node keeps at `kEmptyKey`, so a
+permuted node is sentinel-padded for free. Do not "recover" the sixteenth slot without reading the
+last section of the design document first.
+
+Slot order is insertion order, so the lanes are not sorted in memory and `lower_bound` permutes them
+into rank order before comparing: `lower_bound_perm_avx512` does it with one `vpermd`, the AVX2 kernel
+with four permutes and two blends. The load is masked to the live slots, and that mask is about
+concurrency, not about the answer -- a writer is storing into slot `count` while the kernel runs, and
+an unmasked 64-byte load would race with it. No test can catch its removal and neither can TSan,
+which does not instrument the vector load; the mask is justified by the memory model alone.
+
+**`NodeData`'s level-0 link and its order word both live inside the payload.** That is what makes a
+split atomic. A split changes a node's contents and its successor at once, so it publishes the right
+half first and then swaps the left half's payload pointer in a single release store: a reader sees
+either the old full node or the new pair, never a state where a key is duplicated across both or
+missing from both. Moving either `next` or `order` out into `ListNode` beside the tower would need
+two stores and would expose exactly those states. Do not move them.
 
 Above level 0 is a skiplist tower with branching factor four, and everything in it is an
 accelerator and never the truth: a stale or missing tower pointer costs a longer walk, never a
@@ -195,12 +218,14 @@ fallback is removed; random keys tie too rarely to notice.
 Readers are lock-free and never write. Writers take a per-node spinlock that pauses 64 times and
 then yields. This narrows the "lock-free concurrency" pillar and is recorded rather than hidden: a
 fully lock-free ordered insert has to shift keys inside a sorted node, which is not one atomic
-operation, so the design is copy-on-write with a CAS retry plus a lock to stop writers livelocking
-against each other. The backoff yields because RocksDB routinely runs more writers than cores, where
+operation, so the design publishes through a single release store with a retry plus a lock to stop
+writers livelocking against each other. Phase 4b shrank what that lock covers from an allocation and
+a fifteen-key merge to three stores, which is what makes replacing it with a CAS on the order word a
+live question rather than an idle one; it was deliberately left for its own phase. The backoff yields because RocksDB routinely runs more writers than cores, where
 a flat spin burns every other thread's slice while the lock holder waits to be scheduled.
 
 The layout that all of this protects is enforced by `static_assert`, not by comment: surrogates at
-offset 0, cold fields (`count`, `prefix_len`, `next`, the `string_view`s) beginning at offset 64,
+offset 0, cold fields (`order`, `prefix_len`, `next`, the keys) beginning at offset 64,
 `NodeData` and `ListNode` both 64-byte aligned, and `first_hint` within `ListNode`'s first line.
 `lower_bound_surrogate` reinterprets the surrogate array as a `Node` and depends on those assertions
 holding.
@@ -212,16 +237,28 @@ There is no global `-mavx2`. The vector kernels carry per-function
 decision and lets one binary run on hosts without the ISA. Adding a global `-m` flag would let the
 compiler emit those instructions outside the gated functions and fault on older hardware.
 
-Two kernel families, with different registration duties:
+Three kernel families, with different registration duties:
 
 - `SearchFn` (equality, `search_*`) is registered in `tests/test_search.cpp` in `runnable_kernels()`,
   in `bench/counter_report.cpp` in the `kernels[]` array, and in `bench/bench_search.cpp` as a
   `BENCHMARK_TEMPLATE`. None of the three reference each other.
-- `LowerBoundFn` (ordered, `lower_bound_*`) is registered in `tests/test_search.cpp` only. It has no
-  counter or timing harness yet, which is a gap worth closing before Phase 4 quotes any ordered
-  number.
+- `LowerBoundFn` (ordered over a sorted node, `lower_bound_*`) is registered in
+  `tests/test_search.cpp` only. Nothing in the structure calls it any more; it is the reference the
+  permuted kernels are reasoned against and the fair comparison for what permuting costs.
+- `LowerBoundPermFn` (ordered over an append-only node, `lower_bound_perm_*`) is what
+  `BasicMemTable` actually dispatches to, and is registered in `tests/test_search.cpp` only.
 
-Both carry a `runnable` flag derived from `detect_isa()`. The ISA guards are not optional
+Registering a permuted kernel there is not a formality, and this is the one place in the repository
+where skipping a test would go unnoticed indefinitely. `sorted_position` confirms every SIMD
+candidate against the comparator and falls back to binary search, so an ordered kernel returning
+noise still yields correct lookups, correct iteration, and a byte-for-byte match against RocksDB's
+skiplist. Four deliberate kernel bugs passed the entire differential suite and fail only in
+`test_search`. Anything that touches these kernels must be checked there.
+
+The counter and timing harnesses still cover the equality family only, which is the remaining
+measurement gap before Phase 4 quotes an ordered number.
+
+All three carry a `runnable` flag derived from `detect_isa()`. The ISA guards are not optional
 bookkeeping: an unguarded AVX-512 kernel executes and faults on a host that lacks it.
 
 Four conventions in the existing kernels are load-bearing and measured, not stylistic.
@@ -261,9 +298,9 @@ remove. `tests/test_concurrent.cpp` interleaves keys across threads for the same
 ranges would put writers on different nodes almost always and would never exercise a writer
 arriving after a split.
 
-`docs/phase1.md` and `docs/phase2.md` quote committed numbers in prose and tables. Changing a kernel
-or the structure means regenerating the results and the document together; a stale document is worse
-than no document. `results/` holds output from `./scripts/run_phase1.sh`, which covers Phase 1 only;
+`docs/phase1.md`, `docs/phase2.md`, `docs/phase4-descent.md` and `docs/phase4b-append.md` quote
+committed numbers in prose and tables. Changing a kernel or the structure means regenerating the
+results and the document together; a stale document is worse than no document. `results/` holds output from `./scripts/run_phase1.sh`, which covers Phase 1 only;
 the Phase 2 numbers in `docs/phase2.md` came from ad-hoc runs of `collision_report` and
 `test_concurrent` and have no script yet. `results/archive-i5-8400h/` is a superseded run kept for
 the cross-generation comparison; never quote it as current. `-march=native`
@@ -293,25 +330,30 @@ Phases 1 through 3 are complete. The SIMD kernels are correct and fast, the stan
 correct and concurrent, and Aparajita builds as a RocksDB plugin that `db_bench` selects by name and
 that matches the default skiplist byte for byte.
 
-Phase 4 is under way and split in two. Phase 3 closed 17% behind the skiplist on `fillrandom` and
-33% behind on `readrandom`, because a lookup spent about thirty tower hops reaching the right node --
-not eight, as `docs/phase3.md` first estimated -- each one a virtual comparator call on a full
-internal key, while the SIMD kernel only replaced the handful of comparisons inside the final
-sixteen-key node.
+Phases 4a and 4b are also complete, and between them Aparajita is now ahead of the default skiplist
+on both halves of the workload it was written to beat. Phase 3 closed 17% behind on `fillrandom` and
+33% behind on `readrandom`. Two structural problems accounted for all of it, and neither was in the
+SIMD kernels.
 
-Phase 4a fixed the descent and is described in `docs/phase4-descent.md`. Each node caches the first
-eight bytes of its first key, so a tower hop compares two integers in a line it has already loaded
-and only falls back to the comparator on a tie. Reads are now ahead of the skiplist and writes are
-not; the remaining write cost is copy-on-write rebuilding a whole node per insert, which is Phase 4b.
-`results/phase4-descent.txt` has the numbers and the RTTI caveat that goes with them.
+Phase 4a fixed the descent (`docs/phase4-descent.md`). A lookup spent about thirty tower hops
+reaching the right node -- not eight, as `docs/phase3.md` first estimated -- each a virtual
+comparator call on a full internal key. Each node now caches the first eight bytes of its first key,
+so a hop compares two integers in a line it has already loaded and only a tie falls back to the
+comparator. `results/phase4-descent.txt` has the numbers and the RTTI caveat that goes with them.
+
+Phase 4b fixed the insert (`docs/phase4b-append.md`). Copy-on-write rebuilt a whole node per insert,
+which cost 445 bytes of arena per key against a live structure of 40 and scattered the nodes a
+lookup walks across ten times the memory they occupy. A node is now append-only and publishes an
+insert as one store of a 64-bit order word. `fillrandom` crossed over with it and `readrandom`
+improved by a sixth for free. `results/phase4b-append.txt` has the numbers.
 
 What Phase 3 answered, and what it left open:
 
-- **Write amplification is largely gone on the RocksDB side.** `MemTableRep::Allocate` hands key
-  storage to the caller, so the rep never copies a key and an entry is a bare 8-byte pointer into
-  RocksDB's arena rather than a 16-byte `std::string_view`; the node payload is 208 bytes, not 336.
-  What remains is that copy-on-write rebuilds a whole 208-byte node per insert, which is Phase 4's
-  second candidate.
+- **Write amplification is gone on the RocksDB side.** `MemTableRep::Allocate` hands key storage to
+  the caller, so the rep never copies a key and an entry is a bare 8-byte pointer into RocksDB's
+  arena rather than a 16-byte `std::string_view`. Phase 4b then removed the per-insert node rebuild,
+  so the rep allocates only when a node splits. Where the rep used to charge roughly three times the
+  skiplist's arena per key it now charges about 1.4 times.
 - **The surrogate is a candidate, never an answer.** `Traits::order_bytes` strips the 8-byte packed
   tag so the prefix and surrogate are computed on the user key, but bytewise order on the user key
   is not RocksDB's order: a custom comparator can disagree, and equal user keys are separated by a
@@ -320,13 +362,25 @@ What Phase 3 answered, and what it left open:
 - `arena.hpp` was a stand-in written against arena semantics deliberately, and swapping in
   `rocksdb::Allocator` behind `Traits::allocate` was the substitution it was meant to be. Its single
   mutex is gone on the RocksDB path; the standalone harnesses still use it.
-- ThreadSanitizer coverage at 64 threads is still the one open Phase 2 exit criterion, and closing
-  it still needs a host with more cores rather than a change to the structure.
+- ThreadSanitizer coverage at 64 threads is still the one open Phase 2 exit criterion, but the
+  standing guess about it is now measured and wrong. It is not core count: on an idle 16-core Xeon
+  the 64-thread case ran 606 seconds without completing, having taken seconds at 1, 4 and 16. The
+  work grows with contention, not with cores -- all 64 threads walk the key space at the same rate
+  and pile onto one node's lock, and every `test_and_set` in the backoff loop is a TSan event.
+  Closing it wants the test changed, by interleaving key ranges or shortening the spin budget under
+  instrumentation, rather than a bigger machine.
 
 The development laptop is an i5-11300H (Tiger Lake) with 8 logical cores. It has AVX-512, unlike the
 i5-8400H that produced the archived results, but it runs under WSL2 where the governor is not
 readable and cycle dispersion is an order of magnitude worse. It is a fine correctness host and a
 poor measurement one, and it is the host on which the TSan target hangs.
+
+Phase 4b's numbers in `results/phase4b-append.txt` came from a rented `c4-standard-16` instead, and
+that is the pattern to follow for anything quoted onward. Two details cost time there. TSan aborts at
+startup on Ubuntu 24.04 with "unexpected memory mapping" until `sysctl vm.mmap_rnd_bits=28` is set,
+which is the kernel's ASLR entropy and not a fault in the target. And a benchmark sharing the box
+with a build or a TSan run is not a measurement: the 64-thread TSan case alone drives load average
+past 60 on sixteen cores, so it has to be run before or after the benchmarks and never beside them.
 
 The project is dual-licensed under Apache 2.0 or MIT at the user's option, with the texts in
 `LICENSE-APACHE` and `LICENSE-MIT`. New source files should carry an SPDX header of

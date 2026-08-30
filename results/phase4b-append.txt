@@ -1,0 +1,177 @@
+Phase 4b: the append-only node, controlled comparison
+date:     2026-08-30T13:52:43+01:00
+
+Measured on a rented host, not the development laptop, per the rule in CLAUDE.md.
+
+host:     GCP c4-standard-16, us-central1-a
+cpu:      Intel Xeon Platinum 8581C @ 2.30GHz (Emerald Rapids), 16 vCPU, AVX-512
+os:       Ubuntu 24.04
+gcc:      g++-14 (Ubuntu 14.2.0-4ubuntu2~24.04.1)
+rocksdb:  v9.11.2 (plugin build, Release, USE_RTTI=ON, PORTABLE=1)
+
+The instance was created for this run and deleted immediately after; both it and
+its boot disk were confirmed gone.
+
+== what is being controlled ==
+One host, one RocksDB tree, one set of build flags, one uninterrupted session.
+The only thing that differs between the two halves of every table below is the
+contents of include/aparajita: copy-on-write (the previous commit) against
+append-only (this one). Only the plugin object and the two benchmark binaries are
+rebuilt between halves.
+
+The skip_list rows are the check on that. They are the same rep in both halves, so
+anything that moved them would have moved outside the plugin. They agree to within
+0.5% on db_bench and 3% on memtablerep_bench.
+
+Nothing else ran on the machine during the benchmarks.
+
+== arena, standalone structure, 500,000 keys of 16 bytes ==
+                        copy-on-write   append-only
+   arena per key            445.4 B        100.6 B      -77.4%
+   of which key bytes        16.0 B         16.0 B
+   of which structure       429.4 B         84.6 B
+   live structure           ~40 B          ~40 B        44,378 nodes, 11.3 keys each
+   insert                  1189.6 ns       717.2 ns     -39.7%
+   lookup                   962.0 ns       770.7 ns     -19.9%
+
+Copy-on-write allocated a whole 384-byte payload per insert. The append-only node
+allocates only when a node splits.
+
+The lookup figure is the one worth noticing: the read path was not touched in this
+phase. It improved because the live nodes stopped being scattered through ten
+times the memory they occupy.
+
+== keys resident per memtable (db_bench, 64 MiB write buffer, 2,000,000 keys) ==
+SST files written at a fixed write_buffer_size is a direct read on how much arena
+the rep charges per key: fewer flushes means more keys fit.
+
+                          SST files     keys per memtable
+   skip_list                  5             400,000     (both halves, unchanged)
+   aparajita copy-on-write   15             133,000
+   aparajita append-only      7             286,000     2.1x more
+
+Identical to the figure the laptop produced, as it should be -- it is a property
+of the structure and not of the host.
+
+== db_bench, 5 repetitions, 4 threads, --num=500000 (2M ops), WAL off ==
+--write_buffer_size=1073741824 so nothing flushes and the workload stays resident
+in the memtable; --compression_type=none; --disable_auto_compactions=1.
+
+                        fillrandom us/op                 readrandom us/op
+-- copy-on-write
+   skip_list   5.673 5.551 5.650 5.677 5.629    1.674 1.680 1.752 1.678 1.678
+   aparajita   7.035 7.059 7.018 6.969 7.117    1.440 1.418 1.464 1.463 1.440
+-- append-only
+   skip_list   5.669 5.625 5.659 5.641 5.596    1.733 1.704 1.688 1.750 1.693
+   aparajita   5.520 5.468 5.540 5.531 5.534    1.259 1.248 1.251 1.240 1.253
+
+medians:
+                    before    after    change     vs skip_list before / after
+   fillrandom        7.035    5.531    -21.4%       24.5% slower / 2.0% faster
+   readrandom        1.440    1.251    -13.1%       14.2% faster / 26.6% faster
+
+fillrandom crossed over. readrandom improved by an eighth without the read path
+being touched.
+
+== memtablerep_bench, 7 repetitions, 200k ops, 4 threads ==
+The rep and nothing else: no SSTs, no block cache, no version machinery.
+
+-- copy-on-write
+   skiplist   fillrandom  0.747135 0.778825 0.744645 0.78555 0.77988 0.808305 0.79002
+   skiplist   readrandom  1.14946 1.09512 1.0837 1.14702 1.12794 1.13696 1.16106
+   skiplist   readwrite w  0.277795 0.25045 0.28467 0.291755 0.284245 0.28533 0.269085
+   skiplist   readwrite r  0.833393 0.751358 0.854019 0.875274 0.852744 0.855999 0.807263
+   aparajita  fillrandom  0.80654 0.834365 0.827225 0.781905 0.83485 0.836975 0.793845
+   aparajita  readrandom  0.89642 0.86274 0.86094 0.8434 0.86578 0.84182 0.84748
+   aparajita  readwrite w  0.184785 0.1693 0.17147 0.165825 0.16989 0.18234 0.161845
+   aparajita  readwrite r  0.554361 0.507905 0.514415 0.49748 0.509675 0.547025 0.48554
+-- append-only
+   skiplist   fillrandom  0.7921 0.777805 0.773255 0.751715 0.76521 0.77171 0.76067
+   skiplist   readrandom  1.13498 1.10924 1.09784 1.1272 1.15228 1.06708 1.09698
+   skiplist   readwrite w  0.24799 0.306815 0.281925 0.304535 0.297405 0.2634 0.291955
+   skiplist   readwrite r  0.743977 0.920454 0.845783 0.913614 0.892224 0.790208 0.875874
+   aparajita  fillrandom  0.50467 0.53192 0.515645 0.52224 0.50977 0.52192 0.49744
+   aparajita  readrandom  0.77992 0.81268 0.80314 0.83588 0.77702 0.81876 0.80458
+   aparajita  readwrite w  0.19596 0.188655 0.20512 0.19416 0.189465 0.187245 0.19447
+   aparajita  readwrite r  0.587886 0.565971 0.615366 0.582486 0.568401 0.561741 0.583416
+
+
+medians:
+                    before    after    change     vs skip_list before / after
+   fillrandom        0.827    0.516    -37.7%        6.1% slower / 33.2% faster
+   readrandom        0.861    0.805     -6.5%       24.3% faster / 27.5% faster
+   readwrite write   0.170    0.194    +14.3%       40.2% faster / 33.5% faster
+   readwrite read    0.510    0.582    +14.3%       40.2% faster / 33.5% faster
+
+readwrite -- one writer, three readers -- is the one thing that got worse, and it
+is the predicted cost rather than a surprise. Copy-on-write had a writer touching
+only memory no reader could reach, because the payload it was building was not yet
+published. An append writes into the live node, so a reader searching that node
+shares a dirty line with the writer filling it.
+
+It reproduces on both hosts at the same magnitude: +14.3% here, +13.5% on the
+laptop under WSL2. The structure is still a third faster than the skiplist on that
+benchmark, so the trade is recorded rather than paid down. Quantifying it properly
+wants HITM counters and belongs to Phase 4.
+
+== correctness, same host ==
+   ctest (search_kernels, memtable, concurrent_insert)   3/3 pass
+   concurrent_insert_tsan                                clean at 1, 4 and 16 threads
+   aparajita_memtable_test (RocksDB, Debug tree)         7/7 pass, including the
+                                                         reverse-comparator differential
+                                                         case and MatchesSkipListAcrossFlush
+
+TSan needs `sysctl vm.mmap_rnd_bits=28` on Ubuntu 24.04, or it aborts at startup
+with "unexpected memory mapping" before running anything. That is the kernel's
+ASLR entropy, not a fault in the target.
+
+The 64-thread TSan case was tried here on purpose, since CLAUDE.md records it as
+the one open Phase 2 exit criterion and guesses that it needs a host with more
+cores. Doubling the cores is not enough: on sixteen it ran for 606 seconds without
+completing, on an otherwise idle machine, after 1, 4 and 16 had each finished in
+seconds. So the guess is now measured and wrong, and the cause is not core count.
+Sixty-four threads walking the key space at the same rate all pile onto one node's
+lock, and every test_and_set in the backoff loop is a TSan event, so the work grows
+with contention rather than with the key count. Closing it wants the test changed
+-- interleaved key ranges, or a smaller spin budget under instrumentation -- rather
+than a bigger machine. That belongs to Phase 4 and is out of scope here.
+
+== mutation testing, same host ==
+Eleven mutations applied to the new code, each run against all three local test
+binaries. The column is which binaries caught it.
+
+caught    order_count off by one nibble                        by: search memtable concurrent
+caught    order_slot drops the pad-slot borrow                 by: search memtable concurrent
+caught    avx512 permute drops the slot+1 bias                 by: search
+caught    avx2 permute forgets the signed bias                 by: search
+caught    avx2 permute blends the wrong source half            by: search
+SURVIVES  masked load becomes unmasked                        
+caught    append reuses an occupied slot                       by: memtable concurrent
+caught    prefix-breaking key gets an ordinary lane            by: memtable concurrent
+caught    append skips the hint update at rank 0               by: memtable
+caught    split keeps the stale prefix                         by: memtable concurrent
+caught    fill publishes an identity order off by one          by: memtable concurrent
+
+Three of these are caught by test_search and by nothing else, and that is the
+finding worth carrying forward. sorted_position confirms every SIMD candidate
+against the comparator and falls back to binary search, so an ordered kernel
+returning noise still produces correct lookups, correct iteration and a
+byte-for-byte match against RocksDB's skiplist. A permuted kernel is only ever
+checked in test_search.
+
+The survivor is deliberate. Unmasking the vector load cannot change a result -- it
+is a data race and nothing else -- so no deterministic test can catch it, and
+ThreadSanitizer cannot either: GCC instruments the enclosing function but emits
+the 64-byte load with no __tsan_read in front of it, confirmed by disassembling
+lower_bound_perm_avx512. The mask is justified by the memory model alone.
+
+== reproduce ==
+./scripts/build_rocksdb_plugin.sh
+$B/db_bench --benchmarks=fillrandom,readrandom --num=500000 --threads=4 \
+    --disable_wal=1 --write_buffer_size=1073741824 --compression_type=none \
+    --memtablerep=aparajita --db=/tmp/apdb \
+    --allow_concurrent_memtable_write=true --disable_auto_compactions=1 --seed=1
+$B/memtablerep_bench --memtablerep=aparajita --num_operations=200000 \
+    --num_threads=4 --benchmarks=fillrandom,readrandom,readwrite
+For the other half, check out include/aparajita from the previous commit and
+rebuild the db_bench and memtablerep_bench targets only.

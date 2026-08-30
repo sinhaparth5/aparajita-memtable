@@ -202,17 +202,39 @@ Findings in [docs/phase4-descent.md](docs/phase4-descent.md), numbers in
 
 ## Phase 4b: stop copying a node per insert
 
-Goal: close the write gap, which is now the whole gap.
+Goal: close the write gap, which was the whole gap.
 
-Every insert rebuilds an entire node: a fresh 208-byte payload, sixteen surrogates recomputed, and
-the shared prefix re-derived from the first and last key. The skiplist links one node and returns.
-Copy-on-write bought the atomic split cheaply in Phase 2 and is charging for it on every write.
+Every insert rebuilt an entire node: a fresh payload, sixteen surrogates recomputed, and the shared
+prefix re-derived from the first and last key. The skiplist links one node and returns.
+Copy-on-write bought the atomic split cheaply in Phase 2 and was charging for it on every write, at
+445 bytes of arena per inserted key against a live structure of 40.
 
-The candidate is an append-only node with a published sort permutation. Sixteen four-bit slot
-indices fit exactly in one 64-bit word, which is enough to publish a new order in a single atomic
-store, so an insert becomes a couple of stores rather than a 208-byte rebuild. The per-node spinlock
-is worth reconsidering after that and not before, since its cost is only visible once the rebuild
-stops dominating.
+A node is now append-only. A slot is written once, before the order word that names it, and never
+again; the sorted order over the slots is fifteen four-bit indices in one 64-bit word, and
+republishing that word is the whole of an insert. The word is self-describing -- the count is the
+position of its highest nonzero nibble -- which is what keeps the publication a single store, and
+the slot the `slot + 1` encoding gives up becomes the padding lane the ordered kernels need. Slot
+order is not sorted order, so `lower_bound` permutes the lanes into rank order first: one `vpermd`
+on AVX-512, four permutes and two blends on AVX2.
+
+Findings in [docs/phase4b-append.md](docs/phase4b-append.md), numbers in
+[results/phase4b-append.txt](results/phase4b-append.txt).
+
+| Exit criterion | Target | Result |
+| --- | --- | --- |
+| Arena per insert | an insert that does not allocate | met: allocation only at splits; 445.4 -> 100.6 B/key standalone, and 2.1x more keys resident per memtable under RocksDB |
+| Write throughput | ahead of the skiplist | met: `fillrandom` 8.256 -> 5.955 us/op, from 26.9% behind to 8.1% ahead |
+| Read throughput | no worse | met: `readrandom` 2.779 -> 2.324 us/op, 19.6% ahead, from the locality the smaller arena buys |
+| Publication atomicity | a reader never sees a torn node | met by construction: one release store, and nothing it names is ever revised |
+| Ordered kernels | checked against a reference, not inferred from the structure | met: `lower_bound_perm_*` registered in `tests/test_search.cpp`; four kernel mutations that pass the differential suite fail there |
+| Invariants no query can observe | a test that fails when they break | met: `BasicMemTable::check_invariants`, called from both structure tests |
+| Concurrent read/write | not regressed | not met: `readwrite` is 13% slower than copy-on-write, the cost of a writer dirtying a line readers hold. Still 35% ahead of the skiplist; quantifying it wants HITM counters and belongs to Phase 4 |
+
+Two things this phase deliberately did not do. The per-node spinlock still guards an insert, even
+though it now covers three stores rather than an allocation and a merge, because changing the
+publication protocol and the locking discipline in one step would leave neither measured. And node
+capacity is fifteen rather than sixteen: recovering the slot is possible but costs more in
+explanation than it is worth, and the reasoning is in the design document.
 
 ## Phase 4: empirical evaluation
 
