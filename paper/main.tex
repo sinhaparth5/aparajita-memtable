@@ -1,0 +1,773 @@
+% SPDX-License-Identifier: Apache-2.0 OR MIT
+\documentclass[conference]{IEEEtran}
+\IEEEoverridecommandlockouts
+
+\usepackage{cite}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{url}
+\usepackage[hidelinks]{hyperref}
+
+\def\BibTeX{{\rm B\kern-.05em{\sc i\kern-.025em b}\kern-.08em
+    T\kern-.1667em\lower.7ex\hbox{E}\kern-.125emX}}
+
+\begin{document}
+
+\title{Aparajita: Branchless SIMD Search and Append-Only\\
+       Nodes for LSM-Tree MemTables}
+
+\author{\IEEEauthorblockN{Parth Kumar Sinha}
+\IEEEauthorblockA{Independent Researcher\\
+Oxford, United Kingdom\\
+ORCID: 0009-0002-3120-9301}}
+
+\maketitle
+
+\begin{abstract}
+The in-memory write buffer of an LSM-tree key-value store is searched on every
+read and written on every insert, so its cost per operation sets a floor on the
+whole engine. RocksDB uses a concurrent skip list, which chases pointers across
+independently allocated nodes and evaluates one data-dependent branch per key
+comparison. We present Aparajita, a MemTable representation that replaces the
+skip list with a list of cache-line-sized nodes, each holding sixteen 32-bit
+order-preserving key surrogates searched by a branchless SIMD kernel. Three
+design decisions carry the result. A relational vector compare over a sorted node
+yields a mask whose population count is the lower bound directly, so ordered
+search costs one compare, one movemask and one popcount with no branch. Surrogates
+are taken after the node's shared prefix rather than from the start of the key,
+without which six of seven realistic key distributions collapse to a single
+surrogate value across 200{,}000 keys. Nodes are append-only, and the sorted order
+over their slots is a 64-bit word, so an insert is two stores into a free slot
+followed by one release store that publishes them.
+
+We implement Aparajita as a RocksDB plugin selectable by name without patching
+RocksDB sources, and evaluate it against the default skip list and VectorRep on a
+12-core Emerald Rapids host. Point lookups over a resident MemTable are 22\% to
+39\% faster than the skip list at 1, 4, 16 and 64 threads, with non-overlapping
+samples across ten runs per configuration, backed by 55\% fewer retired
+instructions and 40\% fewer L1 misses per lookup. The skip list is 48\% to 52\% slower
+at the representation level, and Aparajita is 18.8\% faster in single-threaded
+\texttt{db\_bench},
+but the multi-threaded \texttt{db\_bench} write path is bounded by RocksDB's write
+group rather than by the MemTable: an insert there retires over 22{,}000
+instructions in both representations. We report that ceiling rather than a write
+scaling claim the data does not support.
+\end{abstract}
+
+\begin{IEEEkeywords}
+LSM-tree, key-value store, MemTable, SIMD, branch prediction, cache-conscious
+data structures, RocksDB
+\end{IEEEkeywords}
+
+\section{Introduction}
+
+An LSM-tree \cite{oneil1996lsm,luo2020survey} absorbs writes into an in-memory
+buffer and flushes it to sorted files on disk when it fills. In RocksDB
+\cite{dong2021rocksdb,dong2017space,rocksdb} and in LevelDB \cite{leveldb},
+from which it descends, that buffer is the MemTable, and every read
+consults it before any file, so it sits on both the write path and the read path
+of the entire engine. Its default implementation is a concurrent skip list
+\cite{pugh1990skip}.
+
+A skip list is a good fit for the interface and a poor fit for the hardware. Each
+node is separately allocated, so a search follows a chain of pointers whose
+targets are unrelated in memory, and each hop costs a cache miss that the
+prefetcher cannot anticipate because the address is not known until the previous
+load returns. Each hop also compares one key against one bound, which is a
+data-dependent branch, and the branch is unpredictable by construction: the whole
+point of the comparison is that its outcome is not known in advance. Modern cores
+are built to hide latency through parallelism, and a dependent chain of misses
+followed by mispredicted branches defeats both mechanisms at once.
+
+The alternative this paper explores is to make the unit of search a single cache
+line. If sixteen keys fit in one 64-byte line and can be compared in one or two
+vector instructions, then a search over those sixteen keys costs one cache fill,
+no pointer chase, and no branch at all. Reaching the right line still requires a
+descent, so the design also has to make the descent cheap; a fast leaf reached by
+an expensive walk is not an improvement.
+
+Getting from that idea to a working RocksDB representation raises three problems
+that shape the rest of the paper.
+
+RocksDB keys are variable-length internal keys, not 32-bit integers, so a vector
+lane holds a surrogate rather than a key. The surrogate has to preserve order, or
+the same kernel cannot serve both point lookups and the ordered iteration that
+RocksDB requires. It also has to discriminate, which turns out to rule out the
+obvious choice of leading key bytes.
+
+An ordered structure with fixed-capacity nodes needs an insert that keeps the node
+sorted, and shifting keys inside a node is not a single atomic operation. A design
+that publishes each insert through one release store therefore has to separate the
+key material from the order over it.
+
+The measurement itself is a problem. A MemTable representation is measured through
+a benchmark harness that also exercises a write-ahead log, a block cache, a
+version set and a write-thread group, and several of those cost more per operation
+than the structure under test. Part of this paper's contribution is identifying
+where the harness, rather than the representation, is what a number describes.
+
+\subsection{Contributions}
+
+\begin{itemize}
+\item A cache-line node layout with a branchless ordered SIMD search kernel whose
+      population count is the lower bound directly, measured at 4.03 cycles per
+      probe on AVX-512 and 5.10 on AVX2 against 27.65 for a branchy scalar
+      baseline, with zero branch mispredictions per probe.
+\item A prefix-relative order-preserving surrogate, motivated by a measurement
+      showing that six of seven realistic key distributions give an absolute
+      leading-bytes surrogate no discriminating power at all.
+\item An append-only node whose sorted order is a 64-bit word of packed slot
+      indices, making an insert one release store and reducing arena consumption
+      from 445.4 to 100.6 bytes per key.
+\item An eight-byte descent hint in the node header that replaces a virtual
+      comparator call per tower hop with an integer compare in a line already
+      loaded.
+\item An evaluation against RocksDB's skip list and VectorRep that separates the
+      representation's cost from the harness's, including two measurement errors
+      we made and corrected, and an exit criterion we could not meet.
+\end{itemize}
+
+\section{Background and related work}
+
+\subsection{MemTable representations in RocksDB}
+
+RocksDB exposes the MemTable through the \texttt{MemTableRep} interface and ships
+several implementations. The default \texttt{SkipListRep} wraps a concurrent skip
+list supporting lock-free reads and concurrent inserts. \texttt{VectorRep} appends
+to a \texttt{std::vector} and sorts when the MemTable becomes immutable, which
+makes its inserts very cheap and its reads on a mutable buffer very expensive,
+because a point lookup on an unsorted vector has to sort a copy.
+\texttt{HashSkipListRep} and \texttt{HashLinkListRep} bucket by prefix and are
+useful only when the workload's access pattern matches the prefix extractor.
+
+A reviewer familiar with RocksDB will ask why Aparajita is not VectorRep with
+vector instructions. The answer is that VectorRep gives up ordering, and ordering
+is what a MemTable iterator has to provide. Section~\ref{sec:vectorrep} measures
+what that costs VectorRep in practice.
+
+\subsection{Cache-conscious and SIMD search}
+
+Making search structures fit the memory hierarchy is long-established. Rao and
+Ross showed that removing pointers from B$^+$-tree nodes improves main-memory
+search \cite{rao2000cache}. FAST laid out a tree so that its levels match cache
+line, page and SIMD widths \cite{kim2010fast}. Schlegel et al.\ generalised binary
+search to $k$-ary search driven by vector comparisons \cite{schlegel2009kary}, and
+Zeuch et al.\ applied similar transformations to tree traversal
+\cite{zeuch2014simd}. Masstree combines a trie of B$^+$-trees with careful
+attention to cache line behaviour \cite{mao2012masstree}, the Adaptive Radix Tree
+adapts node representations to density \cite{leis2013art}, and the Bw-Tree reaches
+latch freedom through a mapping table and delta records \cite{levandoski2013bwtree}.
+
+Aparajita differs from this line of work in what it is embedded in rather than in
+the kernel itself. These structures are read-optimised indexes built once or
+updated infrequently. A MemTable is written continuously by many threads while
+being read, is destroyed after a few seconds of life, and must allocate from a
+bump allocator that cannot free or reallocate. The kernel is the easy part; the
+concurrency protocol and the allocation discipline around it are where the design
+effort goes.
+
+\subsection{Key compression and surrogates}
+
+Compressing keys into fixed-width order-preserving codes is the subject of HOPE
+\cite{zhang2020hope}, and hybrid indexes \cite{zhang2016hybrid} use compact
+representations for cold data. Our surrogate is a much simpler object, four bytes
+taken at a node-local offset, and it is a filter rather than a decision: every
+match it produces is confirmed against RocksDB's comparator before it is used.
+Section~\ref{sec:surrogate} explains why removing that confirmation would lose
+keys rather than merely slow lookups down.
+
+\section{Design}
+
+\subsection{Node layout}
+
+A node holds sixteen 32-bit surrogates in exactly one 64-byte cache line, aligned
+so it never straddles a line boundary. AVX2 covers the line in two 256-bit
+compares and AVX-512 in one, so a probe costs one line fill and a fixed number of
+instructions independent of where the answer lies.
+
+Everything else the node needs, the order word, the shared prefix length, the
+level-0 successor pointer and the sixteen full key pointers, begins at offset 64.
+The separation is deliberate: a search that misses touches only the first line,
+and the cold fields are reached only after the vector step has narrowed the answer
+to a single candidate. The layout is enforced by static assertions rather than by
+comment, because the search kernel reinterprets the surrogate array as a vector
+and would silently misbehave if a field migrated into the first line.
+
+\subsection{Branchless ordered search}
+\label{sec:kernel}
+
+The kernel is where the branch mispredictions go away, and the reason it works for
+an ordered structure is a property of the mask rather than of the compare.
+
+Let a node hold surrogates $s_0 \le s_1 \le \dots \le s_{15}$ and let $t$ be the
+target. A relational compare produces the bit mask $m_i = [s_i < t]$. Because the
+node is sorted, the set bits of $m$ form a prefix, and the position of the first
+clear bit is therefore $\mathrm{popcount}(m)$. That value is exactly the lower
+bound: the number of keys in the node strictly below the target. One compare, one
+movemask and one population count give the answer with no branch and no
+trailing-zero count.
+
+Two details in the kernel are necessary for correctness and easy to get wrong. AVX2 has no
+unsigned 32-bit compare, so \texttt{\_mm256\_cmpgt\_epi32} is used with both
+operands biased by \texttt{0x80000000} to map unsigned order onto signed order.
+Without the bias the empty-slot sentinel \texttt{0xFFFFFFFF} reads as $-1$ and
+sorts below every real key, which inverts the padding that keeps a partially
+filled node sorted. AVX-512 provides \texttt{\_mm512\_cmplt\_epu32\_mask}
+natively and needs no bias.
+
+Absence is reported as $k$, the node's key count, rather than as $-1$. The
+distinction is not stylistic. A $-1$ sentinel requires a data-dependent
+conditional to produce, and at a realistic hit ratio that conditional is
+unpredictable; measured, it cost 0.5 branch mispredictions per probe and roughly
+three quarters of the AVX2 kernel's cycles, taking it from 25.4 to 6.2 cycles
+per probe. Folding absence into the compare mask
+removes the conditional, and for the ordered kernel the convention falls out of the
+population count for free.
+
+\subsection{Prefix-relative surrogates}
+\label{sec:surrogate}
+
+A vector lane holds 32 bits and a RocksDB key does not, so the lane holds a
+surrogate. The surrogate must preserve order, which rules out a hash: a hash
+distributes well and destroys the property the lower bound depends on. So the lane
+holds four key bytes loaded big-endian, which makes an unsigned 32-bit compare of
+two surrogates reproduce RocksDB's default bytewise \texttt{memcmp} order. Keys
+shorter than four bytes pad with \texttt{0x00}, because a prefix sorts before any
+key extending it.
+
+Taking those four bytes from the start of the key does not work, and measurement
+is what established it. Across seven synthetic but realistic key distributions at
+200{,}000 keys each, six collapsed to a single distinct surrogate value: a table
+name prefix, a tenant identifier or a big-endian timestamp puts identical bytes at
+the front of every key in a database. A lane that holds the same value for every
+key discriminates nothing, and the SIMD kernel degenerates to a linear scan
+confirmed key by key.
+
+The correction is that the lane never needed to be order-preserving globally, only
+within a node. Each node stores the length of the prefix shared by all its keys,
+and surrogates are taken immediately after it. Two consequences live in the code.
+The prefix is recomputed from the first and last key whenever a node splits, since
+an insert at either end can shorten it and a stale prefix mis-orders every
+surrogate in the node. And a key that does not share the node's prefix has no
+meaningful surrogate at that offset, so it is placed by full comparison instead;
+such a key is provably outside the node's range rather than inside it, so its lane
+saturates in the direction it sorts.
+
+The surrogate is a candidate and never an answer. Bytewise order on the user key
+is not RocksDB's order in general: a column family may install a custom
+comparator, and two entries whose user keys are equal are ordered by a
+\emph{descending} sequence number packed into the internal key. Every SIMD
+candidate is therefore confirmed against the comparator, with a binary search
+fallback when confirmation fails. Four deliberately introduced kernel bugs passed
+a full differential test against RocksDB's skip list because of this
+confirmation, which is why the kernels also carry direct unit tests against a
+scalar reference.
+
+\subsection{Append-only nodes and the order word}
+\label{sec:append}
+
+An ordered node must stay sorted, and an earlier version of this design kept it
+sorted by rebuilding it: every insert allocated a fresh payload, merged the new
+key into the sorted run, and published the new payload pointer with one release
+store. Publication was atomic and cheap to reason about. It also charged a whole
+node to the arena for every key written, 445.4 bytes per key against a live
+structure of 40, and scattered the nodes a lookup walks across ten times the
+memory they occupy.
+
+The current design stops moving keys. A slot is written once and never again, and
+what gets republished is the \emph{order} over the slots. Sorted rank $i$ is held
+in nibble $i$ of a 64-bit word, so a new order is one aligned 64-bit store and
+publication stays exactly as atomic as swapping a pointer was. An insert is two
+stores into a free slot, then one release store of the new order word. Nothing
+already visible moves, so a reader that takes one acquire load of the order word
+holds a consistent view: everything the word names is frozen.
+
+A nibble holds $\mathit{slot}+1$ rather than the slot, so zero means ``this rank is
+unused''. That costs one of the sixteen slots and buys two properties. The word
+becomes self-describing, since the count is the position of its highest nonzero
+nibble, so nothing needs a second store beside it; a second field would need a
+second store and would reopen the torn states the single store exists to prevent.
+And an unused rank decodes to slot 15, the lane no key occupies and every node
+keeps at the sentinel, so a node is padded above its last key for free.
+
+Slot order is insertion order, so lanes are not sorted in memory. The ordered
+kernel turns out not to care. The lower bound is a count of the live keys below
+the target, and a count over a set does not depend on how the set is arranged, so
+permuting the lanes into rank order produces a different vector and the same
+population count. An earlier version of this design did permute, at a measured
+cost of 21.03 against 9.89 cycles per probe on AVX2, and removing the permutation
+changed no answer.
+
+What the kernel does still need is a mask over the live lanes, because a writer
+may be storing into the slot at index \emph{count} while the kernel runs and an
+unmasked 64-byte load would race with it. That mask is the entire residual cost of
+the append-only layout, 1.50$\times$ on AVX-512 and 1.94$\times$ on AVX2 against
+the same kernel over a sorted node. It is justified by the memory model \cite{boehm2008memorymodel} alone: no test
+detects its removal, and ThreadSanitizer cannot either, because the compiler does
+not instrument the vector load.
+
+\subsection{Descent hints}
+
+Reaching the right node is a skip-list tower above level 0, with branching factor
+four. Everything in the tower is an accelerator and never the truth, because the
+search only follows a pointer to a node whose first key is at or below the target,
+and nodes are ordered and never removed; a stale or missing tower pointer costs a
+longer walk and never a wrong answer.
+
+The descent was the dominant cost of a lookup and its size had been estimated
+rather than measured. Measured, a lookup over 500{,}000 keys examined 30.0
+successors, not the eight an earlier design note had assumed, and each one was a
+chain of dependent loads ending in a virtual comparator call on a full internal
+key. Each node now caches the first eight bytes of its first key in its header, so
+a hop compares two integers in a line the hop has already loaded, and only a tie
+falls through to the comparator.
+
+Three invariants hold this up. The hint is immutable for every node but the head,
+because the descent returns the last node whose first key is at or below the key
+being inserted, so an insert into a non-head node sorts at position 1 or later and
+a split leaves the left half's first key alone; the head is the exception and is
+also the only node no hop ever moves to, so its hint is never read. A tie decides
+nothing and falls through to the comparator, which is why the hint is eight bytes
+and the surrogate four: a surrogate tie costs one comparison inside a node already
+in cache, and a hint tie costs the miss chain the hint exists to avoid. And the
+hint is stored before the payload, because a first key never rises, so a new hint
+beside an old payload is a hint that is too small, and too small only ever lets a
+hop enter a node it was already entitled to enter. The other order would expose a
+hint that is too large, which would make a hop stop one node short of the key it
+wanted.
+
+The fast path is disabled unless the representation can confirm that the user
+comparator agrees with bytewise order, because a wrong hop is not a slow lookup
+but a lost key.
+
+\subsection{Concurrency}
+
+Readers are lock-free and never write. A reader takes one acquire load of the
+order word and reads only slots that word names, all of which are frozen.
+
+Writers take a per-node spin lock that pauses 64 times and then yields. This is a
+deliberate narrowing of the lock-free goal \cite{herlihy2008art} and we state it
+rather than hide it. A fully lock-free ordered insert has to shift keys inside a
+sorted node, which is
+not one atomic operation, so the design publishes through a single release store
+with a retry and uses a lock to stop writers livelocking against each other.
+Contention is per node, so two writers meet only when they target the same fifteen
+keys. The backoff yields rather than spinning flat because RocksDB routinely runs
+more writers than cores, where a flat spin burns every other thread's time slice
+while the lock holder waits to be scheduled.
+
+A split is the one operation that changes a node's contents and its successor at
+the same time, so the level-0 link and the order word both live inside the
+payload. The right half is published as a new node first, then a single release
+store swaps the left half's payload pointer and its successor together. A reader
+sees either the old full node or the new pair, never a state where a key is
+duplicated across both or missing from both.
+
+Section~\ref{sec:append} reduced what the writer lock covers from an allocation
+and a fifteen-key merge to three stores, which makes replacing it with a
+compare-and-swap on the order word a live question. We did not attempt it here,
+for a reason Section~\ref{sec:tsan} makes concrete.
+
+\section{Implementation}
+
+Aparajita is a header-only C++20 library of roughly 2{,}000 lines plus a RocksDB
+plugin. The core is a template over a traits policy carrying the three things that
+differ between the standalone structure and the RocksDB representation: what an
+entry is, how order is decided, and where memory comes from. The split, the
+append path and the tower exist once and are shared by both.
+
+The plugin derives from \texttt{MemTableRep} and \texttt{MemTableRepFactory} and
+builds through RocksDB's \texttt{plugin/} mechanism, so \texttt{db\_bench
+--memtablerep=aparajita} selects it without patching RocksDB sources. It
+implements \texttt{Allocate}, \texttt{InsertKey} and its concurrent variants,
+\texttt{Get}, \texttt{GetIterator}, \texttt{ApproximateMemoryUsage} and
+\texttt{MarkReadOnly}. \texttt{IsInsertConcurrentlySupported} returns true, which
+matters because RocksDB routes concurrent writes only to a representation that
+advertises support; without it every multi-threaded write benchmark serialises,
+which is part of why VectorRep loses on write throughput despite a friendlier
+layout.
+
+Two integration details are worth recording. \texttt{MemTableRep::Allocate} hands
+key storage to the caller, so the representation never copies a key and an entry
+is a bare 8-byte pointer into RocksDB's arena. And the descent hint's fast path
+needs to confirm the comparator is the default bytewise one, for which
+\texttt{MemTableRep::KeyComparator} exposes no route other than a
+\texttt{dynamic\_cast}; RocksDB compiles Release with \texttt{-fno-rtti} by
+default, so the evaluation builds with \texttt{USE\_RTTI=ON}, a supported CMake
+option applied to the whole tree. The skip-list rows in
+Section~\ref{sec:evaluation} are the control showing that flag alone moves
+nothing.
+
+Correctness is checked by a differential test against RocksDB's own skip list:
+forward and backward iteration, every \texttt{Get}, \texttt{Seek} and
+\texttt{SeekForPrev} agree byte for byte, under concurrent writes, across a flush,
+and under a reverse comparator. RocksDB's own MemTable gtests build their options
+through \texttt{CurrentOptions()} and never consult \texttt{--memtablerep}, and
+\texttt{db\_stress} resolves that flag through a hardcoded enum, so neither can be
+pointed at a plugin representation without patching RocksDB. That is a limitation
+of the harness rather than of the plugin, and it is why a differential test stands
+in for the upstream suite.
+
+\section{Evaluation}
+\label{sec:evaluation}
+
+\subsection{Method}
+
+All figures come from a GCP \texttt{c4-standard-24} in \texttt{us-central1-b}: a
+Xeon Platinum 8581C (Emerald Rapids), 12 physical cores and 24 logical with SMT
+on, 88\,GiB, Ubuntu 24.04, GCC 14.2, RocksDB v9.11.2 built Release with
+\texttt{USE\_RTTI=ON}. One host, one RocksDB tree, one set of build flags, one
+uninterrupted session, nothing else running. Every representation is selected
+through \texttt{--memtablerep} on the same \texttt{db\_bench} binary, so the only
+thing differing between columns is the representation. Five repetitions per cell,
+and the read and write passes fill independently, giving ten samples per fill
+cell.
+
+Quota capped the shape at 24 vCPUs. The 1- and 4-thread points sit below physical
+core count, 16 sits between physical and logical, and 64 is 2.7$\times$
+oversubscribed. The top of every curve is contention rather than headroom and is
+labelled as such throughout.
+
+Two methodological points cost us a full run each and generalise past this
+project.
+
+\emph{A benchmark knob that sets both the work and the data has to be split before
+a curve over it means anything.} \texttt{db\_bench}'s \texttt{--num} is per thread
+and controls both how much work a thread does and the range its random keys are
+drawn from. The natural way to hold total work constant across thread counts,
+\texttt{--num=TOTAL/threads}, also divides the keyspace: at 1 thread the MemTable
+held 1.26 million distinct keys and at 16 threads it held 125{,}000, each written
+sixteen times, and the measured read hit rate drifted from 63\% to 100\% across
+the curve. That is a working-set sweep in a thread-scaling curve's clothes, and it
+flattered the reads. In the figures reported here \texttt{--num} is pinned at
+2{,}000{,}000 and \texttt{--writes} and \texttt{--reads} carry the per-thread work,
+holding the hit rate at 63\% everywhere.
+
+\emph{Counter differencing has to cancel the setup exactly, not approximately.}
+\texttt{perf} wraps a whole process, so a read benchmark's counters include the
+fill that populated the MemTable, the database open and the flush on close.
+Subtracting a separate fill-only run fails, because the fill is twenty times the
+size of the read pass and the subtraction is two large noisy numbers differenced
+to a small one; it produced negative instruction counts. Every counter figure
+below is instead the difference between two runs of the \emph{same} benchmark that
+differ only in operation count, with an identical fill at an identical seed, so
+everything that is not the extra operations cancels exactly. Reads difference
+20{,}000{,}000 against 2{,}000{,}000 and writes 2{,}000{,}000 against 200{,}000.
+
+\subsection{Search kernels in isolation}
+
+Table~\ref{tab:kernels} reports the kernels over 200{,}000 probes at a 0.5 hit
+ratio, nine repetitions, median, with hits landing on a uniformly random slot and
+the hit and miss mix randomised rather than blocked. Blocking the mix or always
+probing slot 0 lets the branchy baseline exit after one comparison and hides
+exactly the mispredictions the design removes.
+
+\begin{table}[t]
+\caption{Search kernels, cycles per probe, hit ratio 0.5}
+\label{tab:kernels}
+\centering
+\begin{tabular}{lrrrr}
+\toprule
+kernel & cyc/probe & ins/probe & br/probe & miss/probe \\
+\midrule
+\multicolumn{5}{l}{\emph{equality search over a sorted node}} \\
+scalar linear      & 27.65 & 34.50 & 15.24 & 0.5253 \\
+scalar binary      & 70.24 & 51.41 & 13.16 & 1.9095 \\
+scalar branchless  & 16.53 & 90.00 &  3.00 & 0.0000 \\
+AVX2               &  5.01 & 20.00 &  3.00 & 0.0000 \\
+AVX-512            &  4.04 & 15.00 &  3.00 & 0.0000 \\
+\midrule
+\multicolumn{5}{l}{\emph{lower bound over a sorted node}} \\
+scalar             & 40.14 & 26.69 & 11.33 & 1.0390 \\
+scalar branchless  &  8.67 & 44.00 &  3.00 & 0.0000 \\
+AVX2               &  5.10 & 25.00 &  3.00 & 0.0000 \\
+AVX-512            &  4.03 & 16.00 &  3.00 & 0.0000 \\
+\midrule
+\multicolumn{5}{l}{\emph{lower bound over an append-only node (shipped)}} \\
+scalar             & 49.49 & 87.35 & 21.66 & 0.9276 \\
+AVX2               &  9.89 & 41.00 &  4.00 & 0.0000 \\
+AVX-512            &  6.04 & 30.00 &  4.00 & 0.0000 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The branch behaviour is the cleanest result in the paper. Every vector kernel and
+every branchless scalar kernel records 0.0000 mispredictions per probe, against
+0.5253 for the branchy scalar baseline, and the vector kernels do not respond to
+the hit ratio at all: at a 0.9 hit ratio every ordered row reproduces to within
+0.02 cycles, while the branchy baseline moves from 28.49 to 40.47.
+
+Two rows deserve a reader's scepticism and we state them before drawing any
+conclusion from the table.
+
+The shipped AVX2 ordered kernel, at 9.89 cycles per probe, is 14\% slower than
+scalar branchless lower bound at 8.67. SIMD losing to scalar on the ISA that ships
+would be a serious problem if the scalar kernel were an available alternative, and
+it is not: it reads a sorted node, and no scalar branchless kernel exists for the
+append-only layout. The comparison the design actually faces is 9.89 against
+49.49. The wider point stands, which is that the append-only layout bought its
+write win at a read-side price of 1.94$\times$ on AVX2 and 1.50$\times$ on
+AVX-512, and that price is the live-lane mask described in
+Section~\ref{sec:append}.
+
+The equality rows for AVX2 and AVX-512 are not stable across our runs. A second
+run on a different instance size of the same part reports 4.02 and 5.02 rather
+than 5.01 and 4.04, inverting which ISA is faster while retained instruction
+counts stay at 20 and 15. The ordered families reproduce across those same two
+runs to within 0.2 cycles, so we quote the ordered rows and make no claim about
+the relative speed of the two ISAs on equality search.
+
+\subsection{Point lookups}
+
+Table~\ref{tab:reads} reports \texttt{readrandom} over a MemTable-resident
+working set with the write-ahead log disabled, and \texttt{readwhilewriting} with
+one writer alongside the readers. No run in either table produced more than the
+single SST file that the flush on close writes, so every figure is served by the
+MemTable.
+
+\begin{table}[t]
+\caption{Read throughput, kops/s, WAL off. VectorRep is capped at 20
+         operations per run and reported separately in
+         Section~\ref{sec:vectorrep}.}
+\label{tab:reads}
+\centering
+\begin{tabular}{lrrrr}
+\toprule
+threads & Aparajita & skip list & VectorRep & vs.\ skip list \\
+\midrule
+\multicolumn{5}{l}{\texttt{readrandom}} \\
+1  &   731.9 &  528.2 & --- & +38.6\% \\
+4  &  2703.1 & 1969.1 & --- & +37.3\% \\
+16 &  8773.9 & 7181.8 & --- & +22.2\% \\
+64 & 10913.5 & 8677.9 & --- & +25.8\% \\
+\midrule
+\multicolumn{5}{l}{\texttt{readwhilewriting}} \\
+1  &   705.6 &  519.7 & --- & +35.8\% \\
+4  &  2693.8 & 1950.2 & --- & +38.1\% \\
+16 &  8691.9 & 6738.8 & --- & +29.0\% \\
+64 & 10531.9 & 8578.5 & --- & +22.8\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Aparajita is ahead at every thread count on both benchmarks, and the samples do
+not overlap: across ten runs per cell, Aparajita's slowest run beats the skip
+list's fastest at every point but one.
+
+Table~\ref{tab:counters} gives the marginal per-operation cost from the two-point
+differencing described above. Aparajita retires 3{,}271.5 instructions per lookup
+against the skip list's 7{,}349.9, and takes 62.18 L1 misses against 103.99. Those
+are the two mechanisms the design targets, showing up where they were predicted:
+fewer instructions from replacing a chain of virtual comparator calls with integer
+compares in already-loaded lines, and fewer L1 misses from a structure that
+consumes 100.6 rather than 445.4 bytes of arena per key.
+
+\begin{table}[t]
+\caption{Marginal cost per operation, 16 threads}
+\label{tab:counters}
+\centering
+\begin{tabular}{llrrrr}
+\toprule
+benchmark & rep & instr & br miss & br miss \% & L1 miss \\
+\midrule
+\texttt{fillrandom} & Aparajita & 22181.7 & 16.15 & 0.361 & 178.86 \\
+                    & skip list & 24177.1 & 18.01 & 0.379 & 227.73 \\
+                    & VectorRep & 14989.5 & 50.70 & 1.636 & 176.96 \\
+\midrule
+\texttt{readrandom} & Aparajita &  3271.5 &  8.46 & 1.241 &  62.18 \\
+                    & skip list &  7349.9 & 10.39 & 0.727 & 103.99 \\
+\midrule
+\texttt{readwhile-} & Aparajita &  3622.2 &  9.53 & 1.265 &  72.41 \\
+\texttt{writing}    & skip list &  7597.6 & 11.93 & 0.808 & 110.70 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+One inversion in that table is worth stating rather than burying. Aparajita's
+branch miss \emph{rate} on reads is worse than the skip list's, 1.241\% against
+0.727\%, while its branch misses \emph{per operation} are better, 8.46 against
+10.39. Both are true, and they are consistent: the design executes less than half
+as many branches per lookup, so the same absolute count of mispredictions is a
+larger share of a much smaller denominator. Per-operation cost is what a workload
+pays. A paper quoting the rate alone would be quoting the single framing in which
+this design looks worse than the structure it replaces.
+
+\subsection{Inserts, and the ceiling \texttt{db\_bench} imposes}
+
+Table~\ref{tab:writes} reports \texttt{fillrandom}. Aparajita is 18.8\% ahead at
+one thread, 2.6\% ahead at four, and tied at 16 and 64. The 4-thread figure
+reproduces an independent 2.0\% measured on a different host in an earlier phase.
+
+\begin{table}[t]
+\caption{\texttt{fillrandom} throughput, kops/s, WAL off}
+\label{tab:writes}
+\centering
+\begin{tabular}{lrrrr}
+\toprule
+threads & Aparajita & skip list & VectorRep & vs.\ skip list \\
+\midrule
+1  &  678.9 &  571.2 & 2222.9 & +18.8\% \\
+4  &  677.9 &  660.9 & 1201.0 &  +2.6\% \\
+16 & 1394.8 & 1437.7 &  911.1 &  $-$3.0\% \\
+64 &  505.8 &  502.6 & 1101.0 &  +0.6\% \\
+\midrule
+\multicolumn{5}{l}{\emph{scaling relative to 1 thread}} \\
+4  & 1.00$\times$ & 1.16$\times$ & 0.54$\times$ & \\
+16 & 2.05$\times$ & 2.52$\times$ & 0.41$\times$ & \\
+64 & 0.75$\times$ & 0.88$\times$ & 0.50$\times$ & \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The scaling rows are the tell. Neither representation scales, and two structures
+with entirely different insert paths do not accidentally share a scaling curve.
+The counters name the cause: a \texttt{fillrandom} operation at 16 threads retires
+22{,}181.7 instructions in Aparajita and 24{,}177.1 in the skip list. A MemTable
+insert is not twenty-two thousand instructions; an append into a node under a spin
+lock is a few hundred. The rest is RocksDB's write-thread group, where writers
+spin waiting for a group leader to commit the batch, charged identically to every
+representation. At 16 threads on 12 cores, \texttt{db\_bench fillrandom} measures
+RocksDB's write path with the MemTable as a rounding error.
+
+\texttt{memtablerep\_bench} has no write group and no SST, block cache or version
+machinery, and the difference reappears intact. Insert costs 0.5435\,\textmu s/op
+against the skip list's 0.8040, the skip list 48\% slower, and the gap holds at
+48\% to 52\% across all four
+thread counts. RocksDB hardcodes that benchmark's \texttt{fillrandom} to a single
+thread regardless of \texttt{--num\_threads}, so those four columns are four
+samples of one single-threaded measurement rather than a curve; they agree to
+within 3\%, which is the useful thing they say. Its \texttt{readrandom} shows the
+same read advantage narrowing under oversubscription, from 62.5\% at one thread to
+0.4\% at 64.
+
+The claim this evidence supports is that the representation inserts roughly half
+again as fast as the skip list, visible undiluted at one thread and in
+\texttt{memtablerep\_bench}, and swamped by RocksDB's write-group machinery in
+multi-threaded \texttt{db\_bench}. It does not support a multi-threaded
+\texttt{db\_bench} write scaling claim, and we do not make one.
+
+The write-ahead log behaves as expected and we measured it rather than assuming
+it. At 16 threads with the log enabled the two representations run at 1043.0 and
+1048.1\,kops/s against 1394.8 and 1437.7 with it disabled: the log costs about
+27\% and closes the already-small gap to 0.5\%.
+
+\subsection{VectorRep}
+\label{sec:vectorrep}
+
+VectorRep has the friendliest memory layout of the three and loses anyway, which
+is the comparison that motivates an ordered design. It is by far the fastest
+single-threaded fill at 2{,}222.9\,kops/s, because appending to a vector is the
+cheapest insert available, and it is the only representation whose fill throughput
+\emph{falls} as threads are added, 0.54$\times$ at 4 and 0.41$\times$ at 16,
+because \texttt{IsInsertConcurrentlySupported} returns false and every write
+serialises.
+
+Its reads are not slow so much as disqualifying: 0.9 to 3.3 seconds per lookup,
+and $6.4 \times 10^9$ retired instructions per lookup.
+\texttt{VectorRep::Get} builds an iterator, and on a mutable MemTable that
+iterator copies the entire bucket and sorts the copy, because a sorted order
+cannot be cached on a structure still being appended to. Its read benchmarks are
+capped at 20 operations for this reason and reported as capped; uncapped they
+would have run for days.
+
+\subsection{Race freedom}
+\label{sec:tsan}
+
+The concurrent insert and read test runs under ThreadSanitizer
+\cite{serebryany2009tsan} at 1, 4, 16 and 64 threads, and reports no races at any
+thread count on any run.
+
+The cost of that instrumented run is heavy-tailed in a way worth recording,
+because we published a wrong figure for it before measuring it properly. Five runs
+of the same binary on one idle host gave totals of 9.4\,s, 186\,s, 298\,s, 373\,s
+and 524\,s for identical work, and a single 6.9\,ms sample from the fast tail had
+been reported as the result. The per-phase breakdown locates it: 640 total inserts
+take under 3\,ms of race time at 4 threads and up to nine minutes at 64. What
+grows is the number of threads spinning in an instrumented \texttt{test\_and\_set}
+loop, where ThreadSanitizer's per-thread vector clocks make each of those atomics
+cost $O(\text{threads})$.
+
+That is an artifact of instrumentation and not evidence about uninstrumented
+throughput, and we are explicit that it is not a reason to believe the spin lock
+is expensive in production. It is a reason to want the compare-and-swap
+formulation, since that removes the loop the instrumentation chokes on.
+
+\section{Limitations}
+
+Three exit criteria this work set itself are not fully met, and one of them
+concerns the mechanism the design is most directly about.
+
+\textbf{Cross-core invalidation is unmeasured.} Loads that hit a line another core
+holds modified are the counter that would speak most directly to a cache-line
+argument, and we could not collect it. The cloud provider's API rejected the vPMU
+tier documented to cover LLC events on both API versions tried. Under the tier it
+did accept, \texttt{mem\_load\_l3\_hit\_retired.xsnp\_fwd} enumerates in
+\texttt{perf list}, programs without error, reports 100\% enabled time, and then
+counts exactly zero against a run retiring $1.08 \times 10^{11}$ instructions
+across 16 threads. \texttt{cache-references} and \texttt{cache-misses} return
+\emph{not supported} outright. These are PEBS-backed events and the hypervisor
+does not implement PEBS \cite{intel-sdm}, so the counter reads zero rather than
+refusing.
+
+That failure mode is worse than an unsupported event, because ``0.000 cross-core
+hits per operation'' is a publishable-looking number and it would have been false.
+Our harness now calibrates the event against a workload that must produce
+cross-core sharing and demotes it to unavailable if it stays at zero. Two related
+traps are worth passing on: Intel retired the \texttt{XSNP\_HITM} name at Ice Lake
+and the counterpart on this part is \texttt{XSNP\_FWD}, so resolving the event
+name against the host's own \texttt{perf list} matters; and \texttt{perf list |
+grep -q} makes \texttt{grep} exit at its first match, \texttt{perf list} then dies
+of \texttt{SIGPIPE}, and under \texttt{set -o pipefail} every event the host has is
+reported absent. Closing this needs bare metal or a provider that exposes PEBS to
+guests.
+
+\textbf{The scaling curve has no headroom.} Quota capped the host at 12 physical
+cores, so every point above 12 threads is contention. That regime is arguably the
+one RocksDB runs in, since more writers than cores is normal, which is why the
+per-node backoff yields rather than spinning flat. It still cannot be read as
+scaling, and the shape of the curve on a machine with 64 real cores is unknown.
+
+\textbf{The write argument depends on a benchmark most readers do not use.}
+Because multi-threaded \texttt{db\_bench fillrandom} measures RocksDB's write path
+rather than the representation, the insert win has to be argued from
+\texttt{memtablerep\_bench} and from the single-threaded point.
+
+Two smaller omissions are deliberate. The representation does not implement the
+prefix-extractor and Bloom filter paths \cite{bloom1970,dayan2017monkey}, so it
+inherits the base class's full iterator, which is correct but gives up the skip
+list's prefix-Bloom short circuit. And AVX-512 is opportunistic behind a CPUID
+check rather than required, on availability grounds rather than on the frequency
+behaviour the optimization manual describes for wide vector work
+\cite{intel-optimization}: AVX-512 is absent from most AMD parts before Zen 4, and
+Intel disabled it in client parts after Rocket Lake.
+
+\section{Conclusion}
+
+Replacing a pointer-chasing skip list with cache-line nodes searched by a
+branchless SIMD kernel improves MemTable point lookups by 22\% to 39\% inside
+RocksDB, with the improvement traceable to 55\% fewer retired instructions and
+40\% fewer L1 misses per lookup. The kernel work is necessary and far from
+sufficient: two structural problems outside the kernel, an expensive tower descent
+and a per-insert node rebuild, each cost more than the kernel saved, and the
+design only became competitive once both were fixed.
+
+The result we did not get is as informative as the ones we did. Multi-threaded
+\texttt{db\_bench} inserts are bounded by RocksDB's write-thread group at over
+22{,}000 instructions per operation, which no MemTable design can move, and the
+counter that speaks most directly to cross-core invalidation could not be
+collected on virtualised hardware at all. Both are properties of the measurement
+environment rather than of the structure, and both are the kind of thing that is
+easier to state than to discover.
+
+\section*{Availability}
+
+Source, measurement scripts and the raw output behind every figure are at
+\url{https://github.com/sinhaparth5/aparajita-memtable}, under Apache 2.0 or MIT
+at the user's option \cite{aparajita}.
+
+\bibliographystyle{IEEEtran}
+\bibliography{refs}
+
+\end{document}
