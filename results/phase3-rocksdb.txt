@@ -1,0 +1,37 @@
+Phase 3: RocksDB integration, indicative timings
+date:     2026-08-28T07:03:23+01:00
+cpu:      11th Gen Intel(R) Core(TM) i5-11300H @ 3.10GHz
+cores:    8 logical
+gcc:      g++ (Ubuntu 15.2.0-16ubuntu1) 15.2.0
+rocksdb:  v9.11.2 (plugin build, Release, portable)
+
+NOT paper-grade. This is the development laptop, which CLAUDE.md records as a
+fine correctness host and a poor measurement one. Phase 4 does the real
+evaluation on rented hardware. These runs exist to answer one question:
+whether the integration is in the right ballpark. It is not.
+
+== db_bench, 3 repetitions, 4 threads, 500k keys, WAL off, 256MiB write buffer ==
+-- skip_list
+   fillrandom   :       6.386 micros/op 625507 ops/sec 3.197 seconds 2000000 operations;   69.2 MB/s
+   readrandom   :       4.062 micros/op 960908 ops/sec 2.081 seconds 2000000 operations;  104.3 MB/s (490912 of 500000 found)
+   fillrandom   :       6.268 micros/op 638054 ops/sec 3.135 seconds 2000000 operations;   70.6 MB/s
+   readrandom   :       3.952 micros/op 991221 ops/sec 2.018 seconds 2000000 operations;  107.7 MB/s (490850 of 500000 found)
+   fillrandom   :       6.182 micros/op 646939 ops/sec 3.091 seconds 2000000 operations;   71.6 MB/s
+   readrandom   :       3.985 micros/op 989241 ops/sec 2.022 seconds 2000000 operations;  107.4 MB/s (490734 of 500000 found)
+-- aparajita
+   fillrandom   :       7.389 micros/op 541224 ops/sec 3.695 seconds 2000000 operations;   59.9 MB/s
+   readrandom   :       5.368 micros/op 743238 ops/sec 2.691 seconds 2000000 operations;   80.7 MB/s (490670 of 500000 found)
+   fillrandom   :       7.335 micros/op 545200 ops/sec 3.668 seconds 2000000 operations;   60.3 MB/s
+   readrandom   :       5.321 micros/op 747017 ops/sec 2.677 seconds 2000000 operations;   81.1 MB/s (490984 of 500000 found)
+   fillrandom   :       7.282 micros/op 549191 ops/sec 3.642 seconds 2000000 operations;   60.8 MB/s
+   readrandom   :       5.295 micros/op 751214 ops/sec 2.662 seconds 2000000 operations;   81.6 MB/s (491022 of 500000 found)
+
+== memtablerep_bench (RocksDB's own rep harness), 200k ops ==
+-- skip_list
+   write us/op: 0.89948
+   read hit%: 82.9475
+   read us/op: 1.51308
+-- aparajita
+   write us/op: 1.59529
+   read hit%: 86.9045
+   read us/op: 1.72016
