@@ -9,14 +9,12 @@ Measured on a rented host, not the development laptop, per the rule in CLAUDE.md
 Two things were closed here, both of them prerequisites for Phase 4 rather than
 Phase 4 itself.
 
-SUPERSEDED IN PART, AND BY ITS OWN RESULT. The lower_bound_perm_* rows below are
-the kernels as they stood when this was measured, and measuring them is what
-showed the permutation they perform was unnecessary: lower_bound returns a count
-of the live keys below the target, and a count does not depend on how they are
-arranged. The permutation has been removed. Everything below is the cost of work
-the kernels no longer do -- kept because it is the evidence that led to the
-removal, not because it describes the current tree. The permuted family has NOT
-been re-measured since; do not quote an ordered cycle count from here as current.
+The lower_bound_perm_* rows in section 1 are the kernels as they stood when this
+was measured, and measuring them is what showed the permutation they perform was
+unnecessary: lower_bound returns a count of the live keys below the target, and a
+count does not depend on how they are arranged. The permutation was removed, and
+section 3 measures what replaced it. Section 1's permuted rows are kept as the
+evidence that led there; section 3 is the current tree.
 
 
 1. The counter harness now covers the kernel the structure runs
@@ -151,6 +149,87 @@ way. Phase 4a found the descent examined thirty successors where docs/phase3.md
 had estimated eight; this found a harness livelock where CLAUDE.md had recorded
 structural contention. Both were plausible, both were written down as fact, and
 both were cheap to measure once someone did.
+
+
+3. After removing the permutation
+=================================
+
+Host: same family, GCP c4-standard-8, Xeon Platinum 8581C (Emerald Rapids),
+Ubuntu 24.04, GCC 14.2.0, Release. Same probe count, repetitions and hit ratios.
+The sorted-node families reproduce section 1 to within 0.2 cycles across the two
+instance sizes, which is what makes the permuted rows comparable across them.
+
+== 200,000 probes, 9 repetitions, median, hit ratio 0.50 ==
+
+  ordered: lower_bound_* over a sorted node (the reference, unchanged)
+  kernel              cyc/probe   cyc sd  ins/probe    IPC   brnch/prb   miss/prb
+  lb_scalar               40.14     0.32      26.69   0.66       11.33     1.0390
+  lb_scalar_brless         8.67     0.01      44.00   5.07        3.00     0.0000
+  lb_avx2                  5.10     0.00      25.00   4.91        3.00     0.0000
+  lb_avx512                4.03     0.01      16.00   3.97        3.00     0.0000
+
+  ordered: lower_bound_perm_* over an append-only node (no permutation)
+  perm_scalar             49.49     0.12      87.35   1.77       21.66     0.9276
+  perm_avx2                9.89     0.00      41.00   4.15        4.00     0.0000
+  perm_avx512              6.04     0.01      30.00   4.97        4.00     0.0000
+
+Hit ratio 0.90 reproduces every ordered row to within 0.01 cycles. The kernels
+are branchless, so the mix does not reach them.
+
+What the removal bought:
+
+                   before    after   change   instructions
+  perm_avx2         21.03     9.89   -53.0%     70 -> 41
+  perm_avx512        8.12     6.04   -25.6%     42 -> 30
+  perm_scalar       49.54    49.49     none     unchanged, still permutes by design
+
+perm_scalar is unchanged on purpose. It still walks ranks through order_slot, so
+it is a reference that genuinely depends on the order word and the randomized
+trials in tests/test_search.cpp check the equivalence on every run.
+
+And what is left, which is the part worth being precise about:
+
+                 sorted    append-only   residual
+  AVX-512          4.03           6.04      1.50x
+  AVX2             5.10           9.89      1.94x
+
+The residual is not permutation any more -- there is none. It is the live-lane
+mask: order_count on the order word, the mask built from it, and a masked load in
+place of a plain one, which on AVX2 is two compares, two maskloads and two blends
+because the sentinel has to be blended in where maskload would leave zeros. Zeros
+sort below every real key and would be counted; kEmptyKey sorts above and is not.
+
+That mask cannot be removed. A writer is storing into slot `count` while the
+kernel runs, and an unmasked 64-byte load races with it. It is the same mask the
+Phase 4b design document justified on memory-model grounds alone, and TSan still
+cannot see the race it prevents, because GCC does not instrument the vector load.
+So 1.50x and 1.94x are the standing price of reading a node that a writer may be
+appending to, and the honest floor for this design rather than a defect.
+
+One comparison that changed sign, and one that did not. Before the removal the
+AVX2 ordered kernel was 2.4x slower than lb_scalar_brless (21.03 against 8.67),
+which meant SIMD lost to scalar on the shipped ISA. It is now 9.89 against 8.67,
+a 14% gap, and lb_scalar_brless is not an available alternative anyway: it reads
+a sorted node and no scalar branchless kernel exists for the append-only shape.
+The claim "SIMD beats scalar here" is no longer false, but it is close enough to
+even on AVX2 to be worth rechecking if the masking ever changes.
+
+The AVX-512-versus-AVX2 gap on the ordered kernel narrowed from 2.6x to 1.64x
+(6.04 against 9.89). That weakens the case ROADMAP.md briefly made for requiring
+AVX-512: the gap is now the same order as the 20% on the equality kernel plus the
+extra masking AVX2 needs, not a different regime.
+
+== bench_search, probe/ family, wall clock ==
+Directionally identical, on the harness whose scalar rows are not comparable with
+counter_report's because it inlines through a template parameter.
+
+  probe/perm_avx2      48359 -> 23248 ns   -51.9%
+  probe/perm_avx512    19647 -> 12219 ns   -37.8%
+
+== correctness, same tree, same host ==
+  ctest -E tsan                     3/3 passed
+  test_concurrent_tsan              clean at 1, 4, 16, 64; 4.4 ms race at 64
+  standalone equivalence check      1,600,000 comparisons, 0 mismatches
 
 
 Reproduce

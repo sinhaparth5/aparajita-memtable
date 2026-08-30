@@ -269,15 +269,19 @@ skiplist. Four deliberate kernel bugs passed the entire differential suite and f
 `results/phase4-ordered-kernels.txt`; they measured equality only until then, which meant every
 published cycle count was for a kernel the structure had stopped calling at Phase 4b.
 
-Closing that gap immediately paid for itself, and not in the way the numbers first suggested. The
-measured cost of permuting was 4.04 -> 8.12 cycles per probe on AVX-512 and 5.10 -> 21.03 on AVX2,
-which put the AVX2 permuted kernel 2.4x *behind* `lower_bound_scalar_branchless` over a sorted node.
-Chasing that led to the realisation that the permutation was not needed at all, and it has been
-removed; the paragraph above explains why. Those figures are therefore the cost of work the kernels
-no longer do. **The permuted family has not been re-measured since the removal**, so
-`results/phase4-ordered-kernels.txt` quotes the pre-removal kernels and nothing in the tree yet
-quotes the post-removal ones. Re-run `counter_report` on a rented host before citing an ordered
-number anywhere.
+Closing that gap immediately paid for itself. The measured cost of permuting was 4.04 -> 8.12 cycles
+per probe on AVX-512 and 5.10 -> 21.03 on AVX2, which put the AVX2 ordered kernel 2.4x *behind*
+`lower_bound_scalar_branchless`. Asking what that bought produced the answer that it bought nothing,
+and removing it gave 21.03 -> 9.89 on AVX2 and 8.12 -> 6.04 on AVX-512.
+
+The residual over the sorted-node kernels is 1.50x on AVX-512 (6.04 against 4.03) and 1.94x on AVX2
+(9.89 against 5.10), and it is worth knowing what that is, because it is not slack. It is the
+live-lane mask: `order_count`, the mask built from it, and a masked load in place of a plain one,
+which on AVX2 costs two compares, two maskloads and two blends -- the sentinel has to be blended in
+where `maskload` would leave zeros, and zeros sort below every real key and would be counted. The
+mask exists because a writer is storing into slot `count` while the kernel runs. It cannot be
+removed, so those two ratios are the standing price of reading a node under concurrent append rather
+than a defect to fix. Numbers in `results/phase4-ordered-kernels.txt` section 3.
 
 `workload::make_append_node` builds the shape the permuted kernels are measured on: slots in a
 random order with `kPadSlot` at `kEmptyKey`. It mattered more when the kernels permuted, but it is

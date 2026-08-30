@@ -85,7 +85,8 @@ on AVX2, which has no 16-lane crossing permute, four permutes and two blends emu
 
 The inference was wrong, and the counters are what exposed it. `results/phase4-ordered-kernels.txt`
 measured permuting at 2.0x on AVX-512 and 4.1x on AVX2 — enough of a bill to ask what it was buying.
-The answer is nothing. `lower_bound` returns the *number* of live keys below the target, and a count
+The answer is nothing; removing it took AVX2 from 21.03 to 9.89 cycles per probe and AVX-512 from
+8.12 to 6.04. `lower_bound` returns the *number* of live keys below the target, and a count
 over a set does not depend on how the set is arranged: permuting produces a different vector and an
 identical popcount. What needs sortedness is the prefix-of-set-bits *shape*, and the kernel never
 reads the shape. It reads the popcount, and popcount is blind to order.
@@ -99,6 +100,12 @@ writer appending to this node is storing into slot `count` while the kernel runs
 it; the merge source is `kEmptyKey`, which is what those slots already hold and which sorts above
 every real key, so the mask cannot change an answer. This is the one part of the original argument
 that survives intact, and it is the reason the order word is still an argument to the kernel at all.
+
+It is also the whole of what the ordered kernel still costs above the sorted-node one: 1.50x on
+AVX-512 and 1.94x on AVX2, the AVX2 figure larger because `maskload` leaves zeros where the sentinel
+is wanted, and zeros sort below every real key rather than above. That is the standing price of
+reading a node a writer may be appending to, and there is no version of this design that does not
+pay it.
 
 `lower_bound_perm_scalar` still walks ranks through `order_slot`. That is deliberate: it is a
 reference that genuinely depends on the order word, so the randomized trials in `test_search.cpp`

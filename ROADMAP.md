@@ -228,7 +228,7 @@ Findings in [docs/phase4b-append.md](docs/phase4b-append.md), numbers in
 | Read throughput | no worse | met: `readrandom` 1.440 -> 1.251 us/op, 26.6% ahead, from the locality the smaller arena buys |
 | Publication atomicity | a reader never sees a torn node | met by construction: one release store, and nothing it names is ever revised |
 | Ordered kernels | checked against a reference, not inferred from the structure | met: `lower_bound_perm_*` registered in `tests/test_search.cpp`; four kernel mutations that pass the differential suite fail there |
-| Cost of the permutation | measured against the sorted kernel, not argued | met, after the fact, and the answer retired the permutation: 2.0x on AVX-512 and 4.1x on AVX2 (`results/phase4-ordered-kernels.txt`) bought nothing, because a popcount is blind to order. Removed; awaiting a re-measure |
+| Cost of the permutation | measured against the sorted kernel, not argued | met, after the fact, and the answer retired the permutation: 2.0x on AVX-512 and 4.1x on AVX2 bought nothing, because a popcount is blind to order. Removed, and re-measured at 21.03 -> 9.89 cycles per probe on AVX2 and 8.12 -> 6.04 on AVX-512 (`results/phase4-ordered-kernels.txt`) |
 | Invariants no query can observe | a test that fails when they break | met: `BasicMemTable::check_invariants`, called from both structure tests |
 | Concurrent read/write | not regressed | not met: `readwrite` is 14.3% slower than copy-on-write, the cost of a writer dirtying a line readers hold. Still 33.5% ahead of the skiplist; quantifying it wants HITM counters and belongs to Phase 4 |
 
@@ -238,9 +238,12 @@ Phase 4 prerequisites were closed: 4.04 -> 8.12 cycles per probe on AVX-512, and
 AVX2, where the missing 16-lane crossing permute costs four permutes and two blends. Asking what
 that bought produced the answer that it bought nothing — `lower_bound` returns a count of the live
 keys below the target, and a count is blind to how they are arranged, so the permuted vector and the
-unpermuted one have the same popcount. The kernels no longer permute. `docs/phase4b-append.md` keeps
-the original argument with the correction beside it. The db_bench win was never at stake either way:
-it came from arena locality rather than from the probe.
+unpermuted one have the same popcount. The kernels no longer permute, and the re-measure gives 9.89
+cycles per probe on AVX2 against 21.03, and 6.04 on AVX-512 against 8.12. What remains over the
+sorted-node kernels — 1.94x and 1.50x — is the live-lane mask that keeps a reader off the slot a
+writer is filling, which is not removable. `docs/phase4b-append.md` keeps the original argument with
+the correction beside it. The db_bench win was never at stake either way: it came from arena
+locality rather than from the probe.
 
 Two things this phase deliberately did not do. The per-node spinlock still guards an insert, even
 though it now covers three stores rather than an allocation and a merge, because changing the
@@ -305,9 +308,10 @@ the unordered design above.
 AVX2 as the shipped baseline with AVX-512 as an opportunistic path, or AVX-512 as a requirement.
 This briefly looked decisive and then stopped being. With the permutation in place AVX-512 was 2.6x
 faster than AVX2 on the ordered kernel — 8.12 against 21.03 cycles per probe — because AVX2 had to
-emulate a 16-lane crossing permute it does not have. Removing the permutation removed the emulation,
-so the gap should fall back towards the equality kernel's, though that has not been re-measured.
-Phase 1 weakened half the case for caution: the AVX-512 kernel is 20% faster than AVX2 (4.04
+emulate a 16-lane crossing permute it does not have. Removing the permutation removed the emulation
+and the gap fell to 1.64x (6.04 against 9.89), which is the 20% equality gap plus the extra work AVX2
+does to mask the live lanes: the same regime, not a different one. Phase 1 weakened half the case for
+caution: the AVX-512 kernel is 20% faster than AVX2 (4.04
 against 5.01 cycles per probe, 15 retired instructions against 20) and showed no downclocking at
 all on Emerald Rapids, which is expected for light integer 512-bit work rather than the sustained
 FP and FMA that Intel's frequency licensing actually penalizes. Availability remains the real
