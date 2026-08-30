@@ -149,12 +149,28 @@ Build the plugin against RocksDB's `plugin/` mechanism so `db_bench` can select 
 than patching RocksDB sources. Correctness work in this phase is the RocksDB memtable test suite
 run against the new rep, not custom tests alone.
 
-| Exit criterion | Target |
-| --- | --- |
-| RocksDB memtable test suite | passes against Aparajita |
-| `IsInsertConcurrentlySupported()` | returns true, with the concurrent path exercised |
-| Iterator ordering | matches the skiplist rep's output on the same key set, byte for byte |
-| Selection | `db_bench --memtablerep=aparajita` runs without a RocksDB source patch |
+Results and analysis in [docs/phase3.md](docs/phase3.md); reproduce with
+`./scripts/build_rocksdb_plugin.sh`. RocksDB is pinned at v9.11.2 in that script.
+
+| Exit criterion | Target | Result |
+| --- | --- | --- |
+| RocksDB memtable test suite | passes against Aparajita | partial: RocksDB's memtable gtests and `db_stress` cannot select a plugin rep without patching RocksDB, so a differential gtest against `skip_list` and `memtablerep_bench` were run instead |
+| `IsInsertConcurrentlySupported()` | returns true, with the concurrent path exercised | met |
+| Iterator ordering | matches the skiplist rep's output on the same key set, byte for byte | met: forward, backward, every Get, Seek and SeekForPrev agree, under concurrent writes, across a flush, and under a reverse comparator |
+| Selection | `db_bench --memtablerep=aparajita` runs without a RocksDB source patch | met |
+
+The phase closes correct and slower. `fillrandom` is 17% behind the skiplist and
+`readrandom` 33% behind, consistently and well outside run-to-run spread. The
+cause is structural: a lookup spends about eight tower hops reaching the right
+node, each one a virtual comparator call on a full internal key, and the SIMD
+kernel only replaces the handful of comparisons inside the final sixteen-key
+node. Inserts additionally rebuild a whole node under copy-on-write where the
+skiplist links one and returns.
+
+That reorders Phase 4. Running the full evaluation against a rep that loses by
+17-33% would only document the loss, so the structural work named at the end of
+docs/phase3.md comes first: make the descent cheap rather than only the leaf,
+and stop copying a node per insert.
 
 ## Phase 4: empirical evaluation
 

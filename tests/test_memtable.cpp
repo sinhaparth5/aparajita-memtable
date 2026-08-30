@@ -203,6 +203,101 @@ int main() {
         check(t.size() == std::size(shorts), "all short keys stored");
     }
 
+    // Iteration in both directions, and the two seeks.
+    //
+    // These are the operations RocksDB's MemTableRep::Iterator requires and the
+    // ones the Phase 2 structure never exercised: it only ever walked forward
+    // from the head. prev() in particular has no back-pointer to follow and
+    // re-descends instead, so a node boundary is the interesting case and a
+    // 5000-key table crosses several hundred of them.
+    {
+        Arena arena;
+        MemTable t(arena);
+        std::mt19937_64 rng(20260828);
+        std::set<std::string> ref;
+        while (ref.size() < 5000) {
+            ref.insert(random_key(rng));
+        }
+        for (const auto& k : ref) {
+            t.insert(k);
+        }
+        const std::vector<std::string> sorted(ref.begin(), ref.end());
+
+        // Forward from the front.
+        {
+            std::size_t i = 0;
+            auto it = t.begin();
+            for (; it.valid(); it.next(), ++i) {
+                if (i >= sorted.size() || it.key() != sorted[i]) {
+                    check(false, "forward iteration diverged at " + std::to_string(i));
+                    break;
+                }
+            }
+            check(i == sorted.size(), "forward iteration visited every key");
+        }
+
+        // Backward from the end must reproduce the same order reversed.
+        {
+            auto it = t.begin();
+            it.seek_to_last();
+            check(it.valid() && it.key() == sorted.back(), "seek_to_last lands on the last key");
+            std::size_t i = sorted.size();
+            for (; it.valid(); it.prev()) {
+                if (i == 0 || it.key() != sorted[i - 1]) {
+                    check(false, "backward iteration diverged at " + std::to_string(i));
+                    break;
+                }
+                --i;
+            }
+            check(i == 0, "backward iteration visited every key");
+        }
+
+        // next() then prev() must return to where it started, across boundaries.
+        {
+            auto it = t.begin();
+            for (std::size_t i = 0; i + 1 < sorted.size(); ++i) {
+                it.next();
+                it.prev();
+                if (it.key() != sorted[i]) {
+                    check(false, "next/prev round trip failed at " + std::to_string(i));
+                    break;
+                }
+                it.next();
+            }
+        }
+
+        // seek() lands on the first key >= target, seek_for_prev() on the last
+        // key <= target. Probed with keys that are present and keys that are not.
+        {
+            std::mt19937_64 probe(99);
+            for (int trial = 0; trial < 2000; ++trial) {
+                const bool use_present = (trial % 2) == 0;
+                std::string target = use_present
+                                         ? sorted[probe() % sorted.size()]
+                                         : random_key(probe);
+
+                const auto lb = std::lower_bound(sorted.begin(), sorted.end(), target);
+                auto it = t.begin();
+                it.seek(target);
+                if (lb == sorted.end()) {
+                    check(!it.valid(), "seek past the last key is invalid");
+                } else {
+                    check(it.valid() && it.key() == *lb, "seek lands on lower_bound");
+                }
+
+                auto it2 = t.begin();
+                it2.seek_for_prev(target);
+                if (lb != sorted.end() && *lb == target) {
+                    check(it2.valid() && it2.key() == target, "seek_for_prev finds an exact key");
+                } else if (lb == sorted.begin()) {
+                    check(!it2.valid(), "seek_for_prev before the first key is invalid");
+                } else {
+                    check(it2.valid() && it2.key() == *(lb - 1), "seek_for_prev lands below");
+                }
+            }
+        }
+    }
+
     if (g_failures == 0) {
         std::printf("all memtable tests passed\n");
         return 0;

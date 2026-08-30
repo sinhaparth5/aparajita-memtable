@@ -4,6 +4,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Build and test
 
+The header-only core and its own harnesses:
+
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release   # add -DAPARAJITA_NATIVE=ON for -march=native
 cmake --build build -j$(nproc)
@@ -52,6 +54,47 @@ under WSL2 or on a loaded machine, with coefficients of variation reaching 60%; 
 counts from `counter_report` are the reliable instrument because they are immune to frequency
 scaling. And `counter_report` needs `/proc/sys/kernel/perf_event_paranoid` at 2 or lower. It uses
 `perf_event_open(2)` directly, so the `perf` binary does not need to be installed.
+
+## The RocksDB plugin
+
+`plugin/aparajita/` is the RocksDB face of the project and is not built by this repository's
+CMakeLists: it has to be compiled inside a RocksDB checkout, because `MemTableRep` needs internal
+headers (`memory/allocator.h`, `db/lookup_key.h`) that `librocksdb-dev` does not install.
+
+```sh
+./scripts/build_rocksdb_plugin.sh    # clones RocksDB v9.11.2 if absent, builds, runs the checks
+```
+
+RocksDB is pinned at v9.11.2 in that script. The `MemTableRep` interface is not stable across major
+versions, so bumping it means rereading `rocksdb/memtablerep.h` rather than assuming.
+
+Five things about that build cost real time to work out and none are obvious from the plugin README.
+
+Sources are declared in `aparajita.mk` only. RocksDB's CMake appends both the sources parsed out of
+the `.mk` and any `${plugin}_SOURCES` set by `CMakeLists.txt`, so declaring them in both compiles the
+file twice and fails the link on duplicate symbols. Tests are the other way round: `${plugin}_TESTS`
+is read from `CMakeLists.txt` only.
+
+Anything `CMakeLists.txt` sets for RocksDB to read back needs `PARENT_SCOPE`, since RocksDB pulls it
+in with `add_subdirectory`. Without it the include path is set in a scope nobody reads.
+
+The registration hook named by `aparajita_FUNC` must be `extern "C"` in the *global* namespace.
+RocksDB generates its declaration into `build_version.cc` inside an `extern "C"` block and takes its
+address unqualified, so a definition inside `ROCKSDB_NAMESPACE` compiles and then fails to link.
+
+Tests only exist in a Debug build. RocksDB wraps `WITH_TESTS` in a `CMAKE_DEPENDENT_OPTION` that
+forces it off unless `CMAKE_BUILD_TYPE` is exactly `Debug`, so `-DWITH_TESTS=ON` on a Release build
+silently produces no test targets at all. The script keeps a Release tree for `db_bench` and a
+separate Debug tree for `aparajita_memtable_test`, which also turns on RocksDB's internal asserts.
+
+RocksDB 9.11.2 does not compile with GCC 13 or newer without help: several headers use `uint64_t`
+without including `<cstdint>`. The build passes `-include cstdint` rather than patching RocksDB,
+because "selectable without patching RocksDB sources" is an exit criterion that has to stay true.
+
+Two limits worth knowing before promising a test run. RocksDB's own memtable gtests build their
+options through `CurrentOptions()` and never consult `--memtablerep`, and `db_stress` resolves that
+flag through a hardcoded enum rather than the object registry. Neither can be pointed at a plugin rep
+without patching RocksDB. `memtablerep_bench` can, because it goes through `CreateFromString`.
 
 ## Layout
 
@@ -212,28 +255,33 @@ orphaned boot disk survives.
 
 ## State of the repository
 
-Phases 1 and 2 are complete and documented in `docs/phase1.md` and `docs/phase2.md`. Phase 3 has not
-started: the branch `phase3-rocksdb-integration` exists, but no commit on it touches RocksDB, there
-is no `rocksdb::` include anywhere in the tree, and RocksDB is still not a pinned dependency.
-`ROADMAP.md` has wanted it pinned since week 1.
+Phases 1 through 3 are complete. The SIMD kernels are correct and fast, the standalone structure is
+correct and concurrent, and Aparajita builds as a RocksDB plugin that `db_bench` selects by name and
+that matches the default skiplist byte for byte.
 
-What Phase 3 inherits, and what it has to answer for:
+It is also 17% slower than the skiplist on `fillrandom` and 33% slower on `readrandom`. That is the
+single most important fact about the current state and `docs/phase3.md` explains it: a lookup spends
+about eight tower hops reaching the right node, each a virtual comparator call on a full internal
+key, and the SIMD kernel only replaces the few comparisons inside the final sixteen-key node. Phase 4
+is therefore blocked on structural work, not on measurement.
 
-- **Write amplification is the blocking problem.** At 64 threads and 256,000 keys the arena holds
-  448 bytes per key against the skiplist's rough 50. Most of it is the sixteen `std::string_view`s
-  in `NodeData` at 16 bytes each; replacing them with an arena offset and length would be 8, taking
-  the payload from 336 bytes to 208, and that is the obvious first move. A memtable that charges 448
-  bytes per key against `write_buffer_size` flushes far more often than the skiplist it replaces,
-  and no probe-side speed compensates. No `db_bench` comparison is meaningful until this is fixed.
-- **The surrogate only works after prefix stripping**, which becomes harder when internal keys
-  replace plain user keys. An internal key is a user key followed by a packed sequence number and
-  value type, so the prefix computation and every `compare_keys` call has to operate on the user-key
-  portion under RocksDB's comparator rather than on the whole buffer.
-- `arena.hpp` is a stand-in written against arena semantics deliberately, so swapping in
-  `rocksdb::Allocator` should be a substitution rather than a redesign. Its single mutex goes away
-  with it.
-- ThreadSanitizer coverage at 64 threads is the one open Phase 2 exit criterion, and closing it
-  needs a host with more cores rather than a change to the structure.
+What Phase 3 answered, and what it left open:
+
+- **Write amplification is largely gone on the RocksDB side.** `MemTableRep::Allocate` hands key
+  storage to the caller, so the rep never copies a key and an entry is a bare 8-byte pointer into
+  RocksDB's arena rather than a 16-byte `std::string_view`; the node payload is 208 bytes, not 336.
+  What remains is that copy-on-write rebuilds a whole 208-byte node per insert, which is Phase 4's
+  second candidate.
+- **The surrogate is a candidate, never an answer.** `Traits::order_bytes` strips the 8-byte packed
+  tag so the prefix and surrogate are computed on the user key, but bytewise order on the user key
+  is not RocksDB's order: a custom comparator can disagree, and equal user keys are separated by a
+  *descending* sequence number. `sorted_position` therefore confirms every SIMD candidate against
+  the comparator and falls back to binary search. That confirmation is load-bearing, not defensive.
+- `arena.hpp` was a stand-in written against arena semantics deliberately, and swapping in
+  `rocksdb::Allocator` behind `Traits::allocate` was the substitution it was meant to be. Its single
+  mutex is gone on the RocksDB path; the standalone harnesses still use it.
+- ThreadSanitizer coverage at 64 threads is still the one open Phase 2 exit criterion, and closing
+  it still needs a host with more cores rather than a change to the structure.
 
 The development laptop is an i5-11300H (Tiger Lake) with 8 logical cores. It has AVX-512, unlike the
 i5-8400H that produced the archived results, but it runs under WSL2 where the governor is not
@@ -291,7 +339,9 @@ either means rewriting `lower_bound` and the whole iteration path.
 
 Two remain. Whether AVX-512 is opportunistic or required, which now rests on availability rather
 than measured speed. And whether the `MemTableRep` prefix-extractor and bloom paths are in scope for
-the first release, which is a Phase 3 decision and is still unmade.
+the first release: Phase 3 shipped without them, so the rep inherits the base class's
+`GetDynamicPrefixIterator`, which is the full iterator. That is correct but gives up the skiplist's
+prefix-bloom short-circuit, and it stays a deliberate omission rather than a settled answer.
 
 ## The architecture document
 
