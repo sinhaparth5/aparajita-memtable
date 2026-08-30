@@ -119,7 +119,7 @@ Results and analysis in [docs/phase2.md](docs/phase2.md), decisions in
 
 | Exit criterion | Target | Result |
 | --- | --- | --- |
-| ThreadSanitizer over concurrent insert and read | clean, at 1, 4, 16, and 64 threads | partial: clean at 1, 4 and 16; 64 does not complete under instrumentation on an 8-core host and passes uninstrumented |
+| ThreadSanitizer over concurrent insert and read | clean, at 1, 4, 16, and 64 threads | met: clean at all four. The 64-thread case did not complete for two phases; the cause was the test's own start barrier, not the structure, and `results/phase4-ordered-kernels.txt` has the correction |
 | Surrogate collision rate | measured on at least one realistic key distribution, not synthetic sequential keys | met, on seven; the result invalidated the leading-bytes surrogate and forced prefix truncation |
 | Ordering decision | ordered structure or sort-on-flush, decided and written down | met: ordered |
 | Node layout | verified 64-byte aligned and 64 bytes in size by static_assert | met |
@@ -227,8 +227,18 @@ Findings in [docs/phase4b-append.md](docs/phase4b-append.md), numbers in
 | Read throughput | no worse | met: `readrandom` 1.440 -> 1.251 us/op, 26.6% ahead, from the locality the smaller arena buys |
 | Publication atomicity | a reader never sees a torn node | met by construction: one release store, and nothing it names is ever revised |
 | Ordered kernels | checked against a reference, not inferred from the structure | met: `lower_bound_perm_*` registered in `tests/test_search.cpp`; four kernel mutations that pass the differential suite fail there |
+| Cost of the permutation | measured against the sorted kernel, not argued | met, after the fact: 2.0x on AVX-512 and 4.1x on AVX2 (`results/phase4-ordered-kernels.txt`). It was not measured during Phase 4b, because the counter harness covered equality only |
 | Invariants no query can observe | a test that fails when they break | met: `BasicMemTable::check_invariants`, called from both structure tests |
 | Concurrent read/write | not regressed | not met: `readwrite` is 14.3% slower than copy-on-write, the cost of a writer dirtying a line readers hold. Still 33.5% ahead of the skiplist; quantifying it wants HITM counters and belongs to Phase 4 |
+
+One thing this phase did not know it was buying. The counter harness covered the equality kernels
+only, so the price of permuting the lanes went unmeasured until the Phase 4 prerequisites were
+closed: 4.04 -> 8.12 cycles per probe on AVX-512, and 5.10 -> 21.03 on AVX2, where the missing
+16-lane crossing permute costs four permutes and two blends. The db_bench win stands, because it
+came from arena locality rather than from the probe, but on an AVX2-only host the permuted SIMD
+kernel is now slower than `lower_bound_scalar_branchless`. That is a live question for Phase 4 and
+it sharpens the AVX-512 one in "Open technical questions" from an availability argument into a
+measured 2.6x.
 
 Two things this phase deliberately did not do. The per-node spinlock still guards an insert, even
 though it now covers three stores rather than an allocation and a merge, because changing the
@@ -291,6 +301,10 @@ preserve order and allow a range scan to use the same kernel; a hash distributes
 the unordered design above.
 
 AVX2 as the shipped baseline with AVX-512 as an opportunistic path, or AVX-512 as a requirement.
+This is no longer a small gap. On the ordered kernel the structure actually runs, AVX-512 is 2.6x
+faster than AVX2 -- 8.12 against 21.03 cycles per probe -- because AVX2 has no 16-lane crossing
+permute and pays four permutes and two blends for one `vpermd`. On the equality kernel the gap was
+20% and the choice was nearly free; on the permuted kernel the AVX2 path loses to a scalar one.
 Phase 1 weakened half the case for caution: the AVX-512 kernel is 20% faster than AVX2 (4.04
 against 5.01 cycles per probe, 15 retired instructions against 20) and showed no downclocking at
 all on Emerald Rapids, which is expected for light integer 512-bit work rather than the sustained

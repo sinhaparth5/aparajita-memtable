@@ -36,6 +36,26 @@ const SingleNodeFixture& single_node() {
     return f;
 }
 
+// The append-only shape: slots in insertion order, sorted order in a word. This
+// is what BasicMemTable holds and what lower_bound_perm_* is handed, so it is a
+// separate fixture rather than a reuse of the sorted node above -- over sorted
+// slots the permutation is the identity and the vpermd measures nothing.
+struct AppendNodeFixture {
+    std::vector<workload::AppendNode> nodes;
+    std::vector<std::uint32_t> probes;
+
+    AppendNodeFixture() {
+        std::mt19937_64 rng(0xA9A12A11);
+        nodes = workload::make_append_nodes(1, rng);
+        probes = workload::make_perm_probes(nodes, kProbes, kHitRatio, rng);
+    }
+};
+
+const AppendNodeFixture& append_node() {
+    static const AppendNodeFixture f;
+    return f;
+}
+
 // Registration is compile-time but ISA support is not, so a kernel the host
 // cannot run has to opt out from inside the body. The test and counter_report
 // both filter their kernel lists before dispatching; Google Benchmark has no
@@ -63,6 +83,25 @@ void BM_Probe(benchmark::State& state) {
     for (auto _ : state) {
         for (std::uint32_t p : f.probes) {
             benchmark::DoNotOptimize(Fn(node, p));
+        }
+    }
+    state.SetItemsProcessed(static_cast<std::int64_t>(state.iterations()) * kProbes);
+}
+
+// LowerBoundFn is the same function type as SearchFn, so the ordered kernels over
+// a sorted node reuse BM_Probe directly. The permuted family cannot: it takes the
+// order word as a third argument.
+template <LowerBoundPermFn Fn, Isa Needs = Isa::Scalar>
+void BM_ProbePerm(benchmark::State& state) {
+    if (!isa_available(Needs)) {
+        state.SkipWithError("host lacks the required ISA");
+        return;
+    }
+    const auto& f = append_node();
+    const workload::AppendNode& a = f.nodes[0];
+    for (auto _ : state) {
+        for (std::uint32_t p : f.probes) {
+            benchmark::DoNotOptimize(Fn(a.node, p, a.order));
         }
     }
     state.SetItemsProcessed(static_cast<std::int64_t>(state.iterations()) * kProbes);
@@ -113,6 +152,19 @@ BENCHMARK_TEMPLATE(BM_Probe, &search_scalar_binary)->Name("probe/scalar_binary")
 #if APARAJITA_X86
 BENCHMARK_TEMPLATE(BM_Probe, &search_avx2, Isa::Avx2)->Name("probe/avx2");
 BENCHMARK_TEMPLATE(BM_Probe, &search_avx512, Isa::Avx512)->Name("probe/avx512");
+#endif
+
+BENCHMARK_TEMPLATE(BM_Probe, &lower_bound_scalar)->Name("probe/lb_scalar");
+BENCHMARK_TEMPLATE(BM_Probe, &lower_bound_scalar_branchless)->Name("probe/lb_scalar_brless");
+#if APARAJITA_X86
+BENCHMARK_TEMPLATE(BM_Probe, &lower_bound_avx2, Isa::Avx2)->Name("probe/lb_avx2");
+BENCHMARK_TEMPLATE(BM_Probe, &lower_bound_avx512, Isa::Avx512)->Name("probe/lb_avx512");
+#endif
+
+BENCHMARK_TEMPLATE(BM_ProbePerm, &lower_bound_perm_scalar)->Name("probe/perm_scalar");
+#if APARAJITA_X86
+BENCHMARK_TEMPLATE(BM_ProbePerm, &lower_bound_perm_avx2, Isa::Avx2)->Name("probe/perm_avx2");
+BENCHMARK_TEMPLATE(BM_ProbePerm, &lower_bound_perm_avx512, Isa::Avx512)->Name("probe/perm_avx512");
 #endif
 
 // Sized to this host: 512 nodes = 32 KiB (L1d), 2048 = 128 KiB (L2, 256 KiB),
