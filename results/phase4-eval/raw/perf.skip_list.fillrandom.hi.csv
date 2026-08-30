@@ -1,0 +1,12 @@
+# started on Sun Aug 30 17:11:41 2026
+
+74182082159,,cycles,22798244326,100.00,,
+48094289146,,instructions,22798244326,100.00,0.65,insn per cycle
+9432547372,,branches,22798244326,100.00,,
+35894369,,branch-misses,22798244326,100.00,0.38,of all branches
+<not supported>,,cache-references,0,100.00,,
+<not supported>,,cache-misses,0,100.00,,
+14227248503,,L1-dcache-loads,22798244326,100.00,,
+444566884,,L1-dcache-load-misses,22798244326,100.00,3.12,of all L1-dcache accesses
+0,,mem_load_l3_hit_retired.xsnp_fwd,22798244326,100.00,,
+0,,mem_load_l3_hit_retired.xsnp_no_fwd,22798244326,100.00,,

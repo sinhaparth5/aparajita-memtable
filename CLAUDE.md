@@ -14,6 +14,7 @@ ctest --test-dir build -E tsan --output-on-failure   # see the caution below bef
 ./build/collision_report                         # surrogate quality on seven key distributions
 ./build/bench_search                             # Google Benchmark timings
 ./scripts/run_phase1.sh                          # Phase 1 only, writing results/
+./scripts/run_phase4.sh                          # Phase 4 db_bench evaluation (needs the plugin built)
 ```
 
 Four CTest targets, each also runnable directly for full output:
@@ -33,8 +34,20 @@ A plain `ctest` now terminates, including the TSan target, which was not true be
 the 16-thread line, and both this file and `docs/phase2.md` explained it as lock contention. It was
 the test's own start barrier: every thread spun on `while (!start.load()) {}` with no yield, so the
 threads already created starved the thread still creating the rest, and under TSan each of those
-loads is an instrumented event. The barrier now spins 64 times and yields, and the case finishes in
-6.9 ms of race time. Do not reintroduce a bare spin there.
+loads is an instrumented event. The barrier now spins 64 times and yields. Do not reintroduce a
+bare spin there.
+
+**It is still slow, and this file said otherwise for a day.** The 6.9 ms of race time recorded
+against that fix was a single draw from a heavy tail, not the result. Five runs of the same binary
+on one idle 24-vCPU host gave totals of 9.4 s, 186 s, 298 s, 373 s and 524 s, with the 64-thread
+race phase reaching 523,880 ms in the worst. The barrier was one real cause and fixing it made the
+case terminate every time; it was not the whole cause. What remains is the per-node spinlock's
+backoff under instrumentation: 640 inserts cost under 3 ms of race at 4 threads and up to nine
+minutes at 64 for identical work, because TSan's per-thread vector clocks make every atomic in a
+spin loop cost O(threads). The exit criterion is unaffected -- no races are reported, at any thread
+count, on any run -- but budget minutes for the target, not milliseconds, and see
+`docs/phase4-eval.md`. It is also the strongest argument yet for replacing that spinlock with a CAS
+on the order word.
 
 `-E tsan` is still worth using for routine work simply because the instrumented target is slower,
 and `-DAPARAJITA_TSAN=OFF` still drops it entirely.
@@ -332,11 +345,13 @@ remove. `tests/test_concurrent.cpp` interleaves keys across threads for the same
 ranges would put writers on different nodes almost always and would never exercise a writer
 arriving after a split.
 
-`docs/phase1.md`, `docs/phase2.md`, `docs/phase4-descent.md` and `docs/phase4b-append.md` quote
-committed numbers in prose and tables. Changing a kernel or the structure means regenerating the
-results and the document together; a stale document is worse than no document. `results/` holds output from `./scripts/run_phase1.sh`, which covers Phase 1 only;
-the Phase 2 numbers in `docs/phase2.md` came from ad-hoc runs of `collision_report` and
-`test_concurrent` and have no script yet. `results/archive-i5-8400h/` is a superseded run kept for
+`docs/phase1.md`, `docs/phase2.md`, `docs/phase4-descent.md`, `docs/phase4b-append.md` and
+`docs/phase4-eval.md` quote committed numbers in prose and tables. Changing a kernel or the structure means regenerating the
+results and the document together; a stale document is worse than no document. `results/` holds output from `./scripts/run_phase1.sh`, which covers Phase 1, and from
+`./scripts/run_phase4.sh`, which covers the Phase 4 evaluation and needs the plugin built first;
+`scripts/phase4_summarize.py` turns its raw output into the tables the documents quote, so those
+tables are generated rather than retyped. The Phase 2 numbers in `docs/phase2.md` came from ad-hoc
+runs of `collision_report` and `test_concurrent` and have no script yet. `results/archive-i5-8400h/` is a superseded run kept for
 the cross-generation comparison; never quote it as current. `-march=native`
 (`-DAPARAJITA_NATIVE=ON`) is for local measurement only, since it is not what ships and can silently
 change which kernel the compiler emits, so anything destined for the paper needs the portable build
@@ -360,9 +375,28 @@ orphaned boot disk survives.
 
 ## State of the repository
 
-Phases 1 through 3 are complete. The SIMD kernels are correct and fast, the standalone structure is
-correct and concurrent, and Aparajita builds as a RocksDB plugin that `db_bench` selects by name and
-that matches the default skiplist byte for byte.
+Phases 1 through 4 are complete. The SIMD kernels are correct and fast, the standalone structure is
+correct and concurrent, Aparajita builds as a RocksDB plugin that `db_bench` selects by name and
+that matches the default skiplist byte for byte, and the evaluation the paper reports is measured
+and written up in `docs/phase4-eval.md`.
+
+Phase 4's result in one line: **reads win uniformly and writes win at the rep level but not in
+multi-threaded `db_bench`.** Reads are 22-39% ahead of the skiplist at every thread count with
+non-overlapping samples, backed by 55% fewer instructions and 40% fewer L1 misses per lookup. Writes
+are +18.8% at one thread and a tie at 16 and 64 -- but *neither* rep scales there, and a `fillrandom`
+operation at 16 threads retires 22,182 instructions, which no memtable insert costs. That is
+RocksDB's write-thread group, charged identically to every rep. `memtablerep_bench`, which has no
+write group, puts the skiplist 48% behind on insert at every thread count. Do not quote a
+multi-threaded `db_bench` write win; the data does not support one.
+
+Two Phase 4 traps are worth knowing before rerunning anything. `db_bench`'s `--num` is per thread
+and sets the keyspace as well as the work, so `--num=$((TOTAL/threads))` silently shrinks the
+working set as threads go up and turns a scaling curve into a working-set sweep; `--num` is now
+pinned and `--writes`/`--reads` carry the work. And HITM is not collectable on GCP: the API rejects
+the `enhanced` vPMU tier, and under `standard` the event enumerates, programs, reports 100% enabled
+time and counts exactly zero, because it is PEBS-backed and the hypervisor is not. A counter that
+reads zero because it does not work is indistinguishable in the output from one that observed
+nothing, so `run_phase4.sh` calibrates it and demotes it rather than reporting a zero.
 
 Phases 4a and 4b are also complete, and between them Aparajita is now ahead of the default skiplist
 on both halves of the workload it was written to beat. Phase 3 closed 17% behind on `fillrandom` and
@@ -396,11 +430,13 @@ What Phase 3 answered, and what it left open:
 - `arena.hpp` was a stand-in written against arena semantics deliberately, and swapping in
   `rocksdb::Allocator` behind `Traits::allocate` was the substitution it was meant to be. Its single
   mutex is gone on the RocksDB path; the standalone harnesses still use it.
-- ThreadSanitizer coverage at 64 threads is **closed**, and neither standing explanation for it was
-  right. It was not core count, and it was not lock contention either: the instrumented build
-  already runs only 640 inserts at 64 threads, which no amount of contention stretches to ten
-  minutes. It was the test's own start barrier busy-spinning. Fixed, clean at 1, 4, 16 and 64, and
-  the whole instrumented run takes about 90 ms. See `results/phase4-ordered-kernels.txt`.
+- ThreadSanitizer coverage at 64 threads is **closed** in the sense that matters -- no races are
+  reported at 1, 4, 16 or 64 on any run -- and both standing explanations for the old hang were
+  wrong, as was the first correction. It was not core count. It was not lock contention in the
+  structure. The test's own start barrier busy-spinning was a real cause and fixing it made the
+  case terminate. But "the whole instrumented run takes about 90 ms", recorded here after that fix,
+  was a fast-tail sample: the same binary on one idle host ranges from 9 s to 524 s.
+  `docs/phase4-eval.md` has the numbers and the reason.
 
 The development laptop is an i5-11300H (Tiger Lake) with 8 logical cores. It has AVX-512, unlike the
 i5-8400H that produced the archived results, but it runs under WSL2 where the governor is not

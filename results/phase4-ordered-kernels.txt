@@ -240,3 +240,33 @@ Reproduce
   ./build/bench_search --benchmark_filter=probe/
   ./build/test_concurrent
   ./build/test_concurrent_tsan           # now terminates; ~90 ms total
+
+
+=============================================================================
+CORRECTION, appended 2026-08-30 after the Phase 4 evaluation run
+=============================================================================
+Section 2 of this file reports the 64-thread ThreadSanitizer case finishing in
+6.9 ms of race time after the start-barrier fix, and the reproduce block below
+says "now terminates; ~90 ms total". Both figures are real -- they are what that
+host printed -- and both are unrepresentative.
+
+Five runs of the same binary on one idle c4-standard-24 gave totals of 9.4 s,
+186 s, 298 s, 373 s and 524 s, with the 64-thread race phase reaching 523,880 ms
+in the worst of them. The distribution is heavy-tailed and 6.9 ms was a draw from
+its fast end.
+
+What this file gets right and what it gets wrong, precisely:
+
+  right   The barrier was a real bug. Threads spun on a bare load while main was
+          still creating the rest, and under TSan each of those loads is an
+          instrumented event. Fixing it took spawn from dominating to 11.7 ms and
+          made the case terminate every time, which it had not done before.
+
+  wrong   The conclusion that the barrier was the whole cause. It was not. The
+          remaining cost is the per-node spinlock's backoff under instrumentation:
+          640 inserts take under 3 ms of race at 4 threads and up to nine minutes
+          at 64 for identical work, because TSan's per-thread vector clocks make
+          every atomic in a spin loop cost O(threads).
+
+The exit criterion is unaffected: TSan reports no races at 1, 4, 16 or 64 on any
+run. What changed is the claim about cost. See docs/phase4-eval.md.
