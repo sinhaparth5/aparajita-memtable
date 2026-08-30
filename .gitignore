@@ -34,5 +34,6 @@ paper/*.out
 paper/*.fls
 paper/*.fdb_latexmk
 paper/*.synctex.gz
-paper/main.pdf
+# The built paper is tracked: the README links to it, and the Zenodo deposit
+# should carry the artifact it describes. Everything else LaTeX emits is not.
 paper/arxiv-submission.tar.gz

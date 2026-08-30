@@ -12,12 +12,14 @@ access uses C++20 acquire/release atomics instead of locks.
 
 ## Scope change from the previous version of this file
 
-The earlier roadmap was derived from `High Performance C++ System Architecture.md` before the
-project scope was known. Most of that document no longer applies. A `MemTableRep` runs inside
-RocksDB's own thread and I/O model, so its thread-per-core execution model, its io_uring and SQPOLL
-work, and its write-ahead-log phase are all RocksDB's concern rather than this plugin's. What
-survives from it is the microarchitectural material: cache line alignment and false sharing,
-Struct of Arrays layout, static dispatch over virtual calls, and the `perf` methodology.
+The earlier roadmap was derived from a general high-performance C++ architecture document written
+before the project scope was known, and most of it did not survive contact with the scope. A
+`MemTableRep` runs inside RocksDB's own thread and I/O model, so a thread-per-core execution
+model, io_uring and SQPOLL work, and a write-ahead-log phase are all RocksDB's concern rather
+than this plugin's. What survived is the microarchitectural material -- cache line alignment and
+false sharing, Struct of Arrays layout, static dispatch over virtual calls, and the `perf`
+methodology -- and it is now stated directly in this file and in `CLAUDE.md`, so the source
+document has been removed rather than kept as a file that mostly does not apply.
 
 ## Schedule
 

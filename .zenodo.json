@@ -1,0 +1,35 @@
+{
+  "title": "Aparajita: a SIMD memtable for RocksDB",
+  "upload_type": "software",
+  "access_right": "open",
+  "license": "apache-2.0",
+  "creators": [
+    {
+      "name": "Sinha, Parth Kumar",
+      "orcid": "0009-0002-3120-9301",
+      "affiliation": "Independent Researcher, Oxford, United Kingdom"
+    }
+  ],
+  "description": "<p>Aparajita is a C++20 in-memory buffer (<code>MemTableRep</code>) for RocksDB and LevelDB-style LSM-tree engines, and a drop-in replacement for RocksDB's default concurrent skip list. It is selected by name through <code>db_bench --memtablerep=aparajita</code> without patching RocksDB sources.</p><p>A skip list chases pointers across heap allocations, so every key comparison risks a cache miss and a branch misprediction. Aparajita packs fifteen 32-bit order-preserving key surrogates and a sentinel into one 64-byte cache line and searches them with a single branchless vector compare: because a relational compare over a sorted node yields a mask whose set bits form a prefix, the population count of that mask is the lower bound directly.</p><p>Measured against RocksDB v9.11.2's default skip list on an Intel Xeon Platinum 8581C, point lookups are 22 to 39 percent faster and ordered seeks 15 to 29 percent faster at 1, 4, 16 and 64 threads, with non-overlapping samples. Iteration is 3 to 4 percent slower and the representation charges about 1.4 times the skip list's arena per key; both are reported rather than omitted.</p><p>This deposit is the software artifact accompanying the paper <em>Aparajita: Eliminating CPU Cache Line Invalidations and Branch Mispredictions in LSM-Tree MemTables via SIMD Register Alignment</em>. It is dual-licensed under Apache-2.0 or MIT at the user's option.</p>",
+  "keywords": [
+    "RocksDB",
+    "LSM-tree",
+    "memtable",
+    "SIMD",
+    "AVX-512",
+    "AVX2",
+    "branchless search",
+    "cache line alignment",
+    "key-value store",
+    "database systems"
+  ],
+  "language": "eng",
+  "related_identifiers": [
+    {
+      "identifier": "https://github.com/sinhaparth5/aparajita-memtable",
+      "relation": "isSupplementTo",
+      "resource_type": "software",
+      "scheme": "url"
+    }
+  ]
+}

@@ -1,0 +1,55 @@
+# Machine-readable citation metadata.
+# Schema: https://citation-file-format.github.io/
+cff-version: 1.2.0
+title: "Aparajita: a SIMD memtable for RocksDB"
+message: >-
+  If you use this software, please cite both the software itself
+  and the paper that describes it.
+type: software
+authors:
+  - family-names: Sinha
+    given-names: Parth Kumar
+    orcid: "https://orcid.org/0009-0002-3120-9301"
+    affiliation: Independent Researcher
+    city: Oxford
+    country: GB
+repository-code: "https://github.com/sinhaparth5/aparajita-memtable"
+abstract: >-
+  Aparajita is a C++20 in-memory buffer (MemTableRep) for RocksDB and
+  LevelDB-style LSM-tree engines, and a drop-in replacement for RocksDB's
+  default concurrent skip list. It packs fifteen 32-bit order-preserving key
+  surrogates and a sentinel into one 64-byte cache line and searches them with
+  a single branchless vector compare, so that the population count of the
+  compare mask is the lower bound directly. Point lookups are 22 to 39 percent
+  faster than the skip list and ordered seeks 15 to 29 percent faster, at 1, 4,
+  16 and 64 threads.
+keywords:
+  - RocksDB
+  - LSM-tree
+  - memtable
+  - SIMD
+  - AVX-512
+  - AVX2
+  - branchless
+  - cache line alignment
+  - key-value store
+  - database systems
+license:
+  - Apache-2.0
+  - MIT
+version: 0.5.0
+date-released: "2026-08-30"
+
+preferred-citation:
+  type: article
+  title: >-
+    Aparajita: Eliminating CPU Cache Line Invalidations and Branch
+    Mispredictions in LSM-Tree MemTables via SIMD Register Alignment
+  authors:
+    - family-names: Sinha
+      given-names: Parth Kumar
+      orcid: "https://orcid.org/0009-0002-3120-9301"
+      affiliation: Independent Researcher
+      city: Oxford
+      country: GB
+  year: 2026
