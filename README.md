@@ -29,7 +29,7 @@ db_bench --memtablerep=aparajita ...
 A skip list chases pointers across heap allocations, so every key comparison risks an L1 or L2
 miss and a branch misprediction. Aparajita packs fifteen 32-bit order-preserving key surrogates
 and a sentinel into one 64-byte cache line and searches them with a single branchless vector
-compare. The population count of the resulting mask *is* the lower bound, so an ordered search
+compare. The population count of the resulting mask _is_ the lower bound, so an ordered search
 costs one compare, one movemask and one `popcnt` — no data-dependent branch anywhere on the read
 path.
 
@@ -39,13 +39,13 @@ Measured on a rented Intel Xeon Platinum 8581C (Emerald Rapids), against RocksDB
 skip list on the same host and the same build. Full method and raw data in
 [`docs/phase4-eval.md`](docs/phase4-eval.md) and [`results/`](results).
 
-| `db_bench` workload | 1 thread | 4 | 16 | 64 |
-| --- | ---: | ---: | ---: | ---: |
-| `readrandom` | **+38.6%** | **+37.3%** | **+22.2%** | **+25.8%** |
-| `readwhilewriting` | **+35.8%** | **+38.1%** | **+29.0%** | **+22.8%** |
-| `seekrandom` (seek alone) | **+28.6%** | **+27.4%** | **+17.2%** | **+15.1%** |
-| `seekrandom` (seek + 10 × `Next`) | −3.0% | −3.3% | −4.3% | −3.8% |
-| `fillrandom` | **+18.8%** | +2.6% | −3.0% | +0.6% |
+| `db_bench` workload               |   1 thread |          4 |         16 |         64 |
+| --------------------------------- | ---------: | ---------: | ---------: | ---------: |
+| `readrandom`                      | **+38.6%** | **+37.3%** | **+22.2%** | **+25.8%** |
+| `readwhilewriting`                | **+35.8%** | **+38.1%** | **+29.0%** | **+22.8%** |
+| `seekrandom` (seek alone)         | **+28.6%** | **+27.4%** | **+17.2%** | **+15.1%** |
+| `seekrandom` (seek + 10 × `Next`) |      −3.0% |      −3.3% |      −4.3% |      −3.8% |
+| `fillrandom`                      | **+18.8%** |      +2.6% |      −3.0% |      +0.6% |
 
 Reads win uniformly and the samples do not overlap. Two results go the other way and are reported
 here for the same reason they are reported in the paper:
@@ -62,12 +62,12 @@ here for the same reason they are reported in the paper:
 The kernel underneath, in cycles per probe over a 16-lane node
 ([`results/phase4-ordered-kernels.txt`](results/phase4-ordered-kernels.txt)):
 
-| kernel | cycles/probe | branch misses/probe |
-| --- | ---: | ---: |
-| scalar `lower_bound`, branchy | 40.14 | 1.04 |
-| scalar `lower_bound`, branchless | 8.67 | 0.00 |
-| AVX2 | 9.89 | 0.00 |
-| AVX-512 | 6.04 | 0.00 |
+| kernel                           | cycles/probe | branch misses/probe |
+| -------------------------------- | -----------: | ------------------: |
+| scalar `lower_bound`, branchy    |        40.14 |                1.04 |
+| scalar `lower_bound`, branchless |         8.67 |                0.00 |
+| AVX2                             |         9.89 |                0.00 |
+| AVX-512                          |         6.04 |                0.00 |
 
 Aparajita charges about 1.4× the skip list's arena per key. That overhead lands on L0 file count
 (7 files against 5 for the same 2M keys), not on flush time: per-key flush cost is 0.425 against
@@ -99,7 +99,7 @@ internal headers that `librocksdb-dev` does not install. The script clones and p
 Four decisions interlock, and each is argued in [`docs/`](docs) and in the paper:
 
 - **The structure is ordered, not sorted at flush time.** RocksDB iterators must yield keys in
-  comparator order, so an unordered buffer only defers the cost. A *relational* compare over a
+  comparator order, so an unordered buffer only defers the cost. A _relational_ compare over a
   sorted node produces a mask whose set bits form a prefix, so its population count is the lower
   bound directly.
 - **A lane holds leading key bytes, not a hash**, because a hash destroys the order the lower bound
